@@ -12,18 +12,9 @@ fast and memory-efficient prefill.</b></p>
 
 ## ⚡ Why TokenGate?
 
-Akin to the shift from dense models to MoE — which enabled trainable
-selection over *model parameters*, computing conditionally with only the
-experts that matter — TokenGate enables trainable selection over a new
-dimension: *long-context input tokens*. It lets a trained LLM skim: a small,
-drop-in gate learns which tokens of a long input to read, and the layers
-above it process only those tokens.
-Across diverse long-context tasks this delivers 1.4–11.3× faster
-time-to-first-token and 1.5–3.4× lower peak prefill memory at no accuracy
-degradation — up to 6.4× faster than the best-performing prior token-pruning
-methods. And because the gate is learned rather than heuristic, it extends
-models you already have — standard transformers and hybrid-attention
-architectures alike — at a training cost comparable to LoRA fine-tuning.
+Current language models read all tokens of their input context, processing each one through all model layers. TokenGated Language Models can *skim*, selectively processing only context that matters through learned token selection for 11.3x faster prefill with 3.4x lower peak memory at no accuracy degradation. TokenGated Language Models achieve conditional computing, akin to MoE, but over a different scaling dimension: long-context inputs. 
+
+TokenGate is a drop-in component that extends any existing model (e.g., trained transformers or hybrid architectures). You can use it as a replacement to standard fine-tuning or PEFT. While fine-tuning/PEFT allow models to improve task-specific accuracy, training models with TokenGate allows models to improve both accuracy *and prefill efficiency** for Pareto-optimal performance. Training with TokenGate is as simple and efficient as PEFT training.
 
 <p align="center"><img src="assets/results_figure.png" width="85%" alt="TokenGate headline results: up to 11.3× faster TTFT and 3.4× lower peak memory at matched accuracy"></p>
 
