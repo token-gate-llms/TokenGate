@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/title.png" width="60%" alt="Token-Gated Language Models"></p>
 
-<p align="center"><b>TokenGate is a drop-in component that lets LLMs <I>skim, then read</i> long-context inputs for
+<p align="center"><b>TokenGate is a drop-in component that lets LLMs <I>selectively skim</i> long-context inputs, processing only context that matters for
 fast and memory-efficient prefill.</b></p>
 
 <p align="center">
