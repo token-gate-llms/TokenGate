@@ -12,9 +12,9 @@ fast and memory-efficient prefill.</b></p>
 
 ## ⚡ Why TokenGate?
 
-Current language models read all tokens of their input context, processing each one through all model layers. TokenGated Language Models can *skim*, selectively processing only context that matters through learned token selection for **11.3x faster** prefill with **3.4x lower memory** at no accuracy degradation. TokenGated Language Models achieve conditional computing, akin to MoE, but for a different scaling dimension: long-context inputs. 
+Current language models read all tokens of their input context, processing each one through all model layers. **TokenGated Language Models can *skim*, selectively processing only context that matters** through learned token selection for **11.3x faster** prefill with **3.4x lower memory** at no accuracy degradation. TokenGated Language Models achieve conditional computing, akin to MoE, but for a different scaling dimension: long-context inputs. 
 
-TokenGate is a drop-in component that extends existing models (e.g., trained transformers or hybrid architectures) to enable learnable token selection. You can use it as a replacement to standard fine-tuning or PEFT. While fine-tuning allows models to improve task-specific accuracy, training models with TokenGate allows models to improve both accuracy *and prefill efficiency** for Pareto-optimal performance. Training with TokenGate is as simple and efficient as PEFT training, while leading to Pareto-optimal inference performance.
+**TokenGate is a drop-in component that extends existing models** (e.g., trained transformers or hybrid architectures) to enable learnable token selection. You can **use it as a replacement to standard fine-tuning or PEFT**. While fine-tuning allows models to improve task-specific accuracy, training models with TokenGate allows models to improve both accuracy *and prefill efficiency** for Pareto-optimal performance. Training with TokenGate is as simple and efficient as PEFT training, while leading to Pareto-optimal inference performance.
 
 <p align="center"><img src="assets/results_figure.png" width="85%" alt="TokenGate headline results: up to 11.3× faster TTFT and 3.4× lower peak memory at matched accuracy"></p>
 
