@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-TARGET map: train ONLY the niah_kamradt pool (isolated NIAH run —
+# see run_e2e_mlpgate_pretrain_niah_iso_coadapt13_*.sh).  Same row-uniform
+# target-balanced sampler semantics as eval_target_train_map_v16.yaml: every
+# (dataset, task) NOT listed gets weight 0.  Pool = the generated
+# Needle-in-a-Haystack (Kamradt, 2023) train split, 12k rows (notes/37).
+# ─────────────────────────────────────────────────────────────────────────────
+version: v17_niah_only
+manifest: iso_niah
+eval_split_manifest: tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json
+
+targets:
+  niah_kamradt:
+    - {dataset: niah_kamradt, task: niah_kamradt}

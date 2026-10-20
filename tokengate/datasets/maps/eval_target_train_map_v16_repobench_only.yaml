@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-TARGET map: train ONLY the longbench_repobench_p pool (isolated
+# repobench run — see run_e2e_mlpgate_pretrain_repobench_iso_coadapt11_*.sh).
+# Same row-uniform target-balanced sampler semantics as
+# eval_target_train_map_v16.yaml: every (dataset, task) NOT listed gets
+# weight 0. Pool copied verbatim from the v16 map (single member, ~14.9k rows).
+# ─────────────────────────────────────────────────────────────────────────────
+version: v16_repobench_only
+manifest: iso_repobench
+eval_split_manifest: tokengate/datasets/eval_splits/longbench_eval_split_repobench_iso_v1.json
+
+targets:
+  longbench_repobench_p:
+    - {dataset: longbench-datasets, task: longbench_repobench_p}

@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-TARGET map: train ONLY the longbench_multi_news pool (isolated
+# multi_news run — see run_e2e_mlpgate_pretrain_multinews_iso_frozen.sh). Same
+# row-uniform target-balanced sampler semantics as eval_target_train_map_v16
+# .yaml: every (dataset, task) NOT listed gets weight 0. Pool copied verbatim
+# from the v16 map (single member, ~44.8k rows).
+# ─────────────────────────────────────────────────────────────────────────────
+version: v16_multinews_only
+manifest: iso_multinews
+eval_split_manifest: tokengate/datasets/eval_splits/longbench_eval_split_multinews_iso_v1.json
+
+targets:
+  longbench_multi_news:
+    - {dataset: longbench-datasets, task: longbench_multi_news}

@@ -1,0 +1,15 @@
+version: iso_multinews
+created: '2026-10-04'
+note: Single-target manifest for the isolated (iso) protocol.
+datasets:
+- dataset: longbench-datasets
+  task: longbench_multi_news
+  prompt_version: longbench_v1
+  source_hf: multi_news[train]
+  n_train_post_filter: 44845
+  ctx_mean: 2677.8
+  ans_mean: 281.4
+  sanity_oracle: 0.163
+  sanity_gated_k2000: 0.16
+  gap: 0.003
+  metric: ROUGE-L

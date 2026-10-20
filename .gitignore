@@ -1,0 +1,66 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Pretraining-data large artifacts.  prepare.py regenerates these on demand;
+# stats.json + sanity/results.json + sanity/*.jsonl logs are small enough to
+# commit and are useful for review.
+datasets/*/*/raw_train.jsonl
+datasets/*/*/raw_val.jsonl
+# No trailing slash: ignore both real `tokenized/` dirs (canonical store) and
+# `tokenized` symlinks that point worktrees at the shared canonical store.
+datasets/*/*/tokenized
+datasets/*/*/tokenized.stale-*
+
+# Training output trees — centralized in the main repo via
+# E2E_GATE_OUTPUT_ROOT / E2E_LORA_BASELINE_ROOT (see e2e_gate_lib.sh).
+# Per-worktree copies should never exist; this keeps `git status` clean if
+# a stray run does land somewhere unexpected.
+e2e_gates/
+lora_baselines/
+gate_data/
+
+# Eval output: ignore data files but keep tracked review artifacts (plots,
+# notebooks) discoverable.  PNGs and ipynb under results/ stay committable.
+results/**/*.csv
+results/**/*.jsonl
+results/**/*.pkl
+results/**/*.pt
+
+# Eval / training logs and W&B local mirrors
+wandb/
+*.log
+
+# LongBench eval signature index — large (~170MB) derived artifact, rebuildable
+# via `python -m tokengate.datasets.longbench_index build`
+tokengate/datasets/indexes/
+/data/
+
+# Training/profiling run logs + scratch drivers (per-run, not source)
+.opt_logs/
+tokengate/datasets/.mfqa_lb_shingles.pkl
+datasets/_wiki_src/
+
+# pixi environment (manifest is the repo-root pixi.toml; roach builds it per clone)
+.pixi/
+
+# NIAH/RULER generated pools + the (copyrighted) PG essay cache — regenerate via
+# datasets/niah_kamradt/generate_niah_kamradt.py
+datasets/niah_kamradt/pg_essays.jsonl
+datasets/niah_kamradt/niah_kamradt_all.jsonl
+datasets/niah_kamradt/ruler_niah8_all.jsonl
+
+# paper-benchmarks results: figures + ckpt_selection.json stay committable;
+# per-row CSVs, metas pickles and logs are regenerable run data
+paper-benchmarks/results/**/*.csv
+paper-benchmarks/results/**/*.pkl
+paper-benchmarks/results/**/*.log
+datasets/niah_kamradt/niah_kamradt_64k.jsonl
+datasets/niah_kamradt/niah_kamradt_128k.jsonl

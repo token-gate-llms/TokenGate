@@ -1,0 +1,12 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-TARGET map: train ONLY the official BioDEX-Reactions pool (isolated
+# run 16 — run_e2e_mlpgate_pretrain_biodexr_iso_coadapt16_*.sh).  Same
+# row-uniform sampler semantics as eval_target_train_map_v16.yaml.
+# ─────────────────────────────────────────────────────────────────────────────
+version: v20_biodexr_only
+manifest: iso_biodexr
+eval_split_manifest: tokengate/datasets/eval_splits/longbench_eval_split_biodexr_iso_v1.json
+
+targets:
+  biodex_reactions:
+    - {dataset: biodex, task: biodex_reactions}

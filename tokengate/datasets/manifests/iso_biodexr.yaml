@@ -1,0 +1,13 @@
+version: iso_biodexr
+created: '2026-10-04'
+note: Single-target manifest for the isolated (iso) protocol.
+datasets:
+- dataset: biodex
+  task: biodex_reactions
+  prompt_version: biodexr_v1
+  source_hf: 'BioDEX/BioDEX-Reactions OFFICIAL task: fulltext_processed input + reactions target + train/validation
+    splits verbatim (datasets/biodex/biodex_reactions/prepare.py)'
+  n_train_post_filter: 9785
+  ctx_mean: 4674.0
+  ans_mean: 28.5
+  metric: F1

@@ -1,0 +1,464 @@
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/flash_api.cpp work/csrc/flash_attn/flash_api.cpp
+--- flash_attn-2.8.3.post1/csrc/flash_attn/flash_api.cpp	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/flash_api.cpp	2026-09-08 23:19:01.186252661 -0700
+@@ -241,16 +241,15 @@
+ }
+ 
+ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+-    FP16_SWITCH(!params.is_bf16, [&] {
+-        HEADDIM_SWITCH(params.d, [&] {
+-            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-                if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
+-                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+-                } else {
+-                    run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+-                }
+-            });
+-        });
++    TORCH_CHECK(params.is_bf16 && params.d == 128, "this build supports bf16 with head_dim 128 only");
++    using elem_type = cutlass::bfloat16_t;
++    constexpr int kHeadDim = 128;
++    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
++        if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
++            run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
++        } else {
++            run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
++        }
+     });
+ }
+ 
+@@ -328,23 +327,22 @@
+     return std::make_tuple(softmax_lse_accum, out_accum);
+ }
+ 
+-void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads){
+-#ifdef FLASHATTENTION_DISABLE_ALIBI
+-    TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
+-    params.alibi_slopes_ptr = nullptr;
+-#else
++void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi_slopes_, int batch_size, int num_heads, int seqlen_k = -1){
++    // Repurposed: a per-key, per-head additive bias (batch_size, num_heads, seqlen_k) fp32, in units of the
++    // raw q.k score (the caller divides by softmax_scale). Only the dense fwd/bwd carry it.
+     if (alibi_slopes_.has_value()) {
+-        auto alibi_slopes = alibi_slopes_.value();
+-        TORCH_CHECK(alibi_slopes.dtype() == torch::kFloat32, "ALiBi slopes must have dtype fp32");
+-        CHECK_DEVICE(alibi_slopes);
+-        TORCH_CHECK(alibi_slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+-        TORCH_CHECK(alibi_slopes.sizes() == torch::IntArrayRef({num_heads}) || alibi_slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}));
+-        params.alibi_slopes_ptr = alibi_slopes.data_ptr();
+-        params.alibi_slopes_batch_stride = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
++        TORCH_CHECK(seqlen_k > 0, "key bias is only supported by the dense fwd/bwd");
++        auto key_bias = alibi_slopes_.value();
++        TORCH_CHECK(key_bias.dtype() == torch::kFloat32, "key bias must have dtype fp32");
++        CHECK_DEVICE(key_bias);
++        TORCH_CHECK(key_bias.stride(-1) == 1, "key bias must have contiguous last dimension");
++        TORCH_CHECK(key_bias.sizes() == torch::IntArrayRef({batch_size, num_heads, seqlen_k}), "key bias must have shape (batch_size, num_heads, seqlen_k)");
++        params.alibi_slopes_ptr = key_bias.data_ptr();
++        params.alibi_slopes_batch_stride = key_bias.stride(0);
++        params.alibi_slopes_head_stride = key_bias.stride(1);
+     } else {
+         params.alibi_slopes_ptr = nullptr;
+     }
+-#endif
+ }
+ 
+ std::vector<at::Tensor>
+@@ -473,7 +471,7 @@
+     at::Tensor softmax_lse_accum, out_accum;
+     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
+         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
+-        head_size_rounded, p_dropout, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
++        head_size_rounded, p_dropout, /*num_splits*/ 1, get_num_sm(get_current_device()), opts);
+ 
+     // number of times random will be generated per thread, to offset philox counter in thc random
+     // state
+@@ -492,7 +490,7 @@
+         params.philox_args = gen->philox_cuda_state(counter_offset);
+     }
+ 
+-    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
++    set_params_alibi(params, alibi_slopes_, batch_size, num_heads, seqlen_k);
+ 
+     if (seqlen_k > 0) {
+         auto stream = at::cuda::getCurrentCUDAStream().stream();
+@@ -755,12 +753,11 @@
+ }
+ 
+ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+-    FP16_SWITCH(!params.is_bf16, [&] {
+-        HEADDIM_SWITCH(params.d, [&] {
+-            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+-                run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+-            });
+-        });
++    TORCH_CHECK(params.is_bf16 && params.d == 128, "this build supports bf16 with head_dim 128 only");
++    using elem_type = cutlass::bfloat16_t;
++    constexpr int kHeadDim = 128;
++    BOOL_SWITCH(params.is_causal, Is_causal, [&] {
++        run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+     });
+ }
+ 
+@@ -903,6 +900,9 @@
+         dv_expanded = dv;
+     }
+ 
++    at::Tensor dbias;
++    if (alibi_slopes_.has_value()) { dbias = torch::zeros({batch_size, num_heads, seqlen_k}, opts.dtype(at::kFloat)); }
++
+     Flash_bwd_params params;
+ 
+     set_params_dgrad(params,
+@@ -950,7 +950,10 @@
+         params.rng_state[1] = std::get<1>(seeds);
+     }
+ 
+-    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
++    set_params_alibi(params, alibi_slopes_, batch_size, num_heads, seqlen_k);
++    params.dbias_ptr = alibi_slopes_.has_value() ? dbias.data_ptr() : nullptr;
++    params.dbias_batch_stride = alibi_slopes_.has_value() ? dbias.stride(0) : 0;
++    params.dbias_head_stride = alibi_slopes_.has_value() ? dbias.stride(1) : 0;
+ 
+     if (seqlen_q > 0) {
+         launch(params, stream);
+@@ -967,7 +970,7 @@
+         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
+     }
+ 
+-    return { dq, dk, dv, softmax_d };
++    return { dq, dk, dv, softmax_d, dbias };
+ }
+ 
+ std::vector<at::Tensor>
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/alibi.h work/csrc/flash_attn/src/alibi.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/alibi.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/alibi.h	2026-09-09 00:15:36.957178973 -0700
+@@ -14,57 +14,45 @@
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+-template <bool Is_causal>
++template <bool Is_causal, int kNColThr = 1>
+ struct Alibi {
+ 
+-    const float alibi_slope;
++    const float * __restrict__ key_bias;
+     const int max_seqlen_k, max_seqlen_q;
++    float kb[kNColThr];
+ 
+-    __forceinline__ __device__ Alibi(const float alibi_slope, const int max_seqlen_k, const int max_seqlen_q)
+-        : alibi_slope(alibi_slope)
++    __forceinline__ __device__ Alibi(const float *key_bias, const int max_seqlen_k, const int max_seqlen_q)
++        : key_bias(key_bias)
+         , max_seqlen_k(max_seqlen_k)
+         , max_seqlen_q(max_seqlen_q) {
+     };
+ 
++    // This thread's bias values for the block starting at col_idx_offset_, loaded before the gemm.
++    __forceinline__ __device__ void prefetch(const int col_idx_offset_) {
++        const int lane_id = threadIdx.x % 32;
++        const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
++        #pragma unroll
++        for (int ni = 0; ni < kNColThr; ++ni) {
++            const int col_idx = col_idx_offset + (ni / 2) * 8 + (ni % 2);
++            kb[ni] = col_idx < max_seqlen_k ? key_bias[col_idx] : 0.f;
++        }
++    }
+ 
+     template <typename Engine, typename Layout>
+     __forceinline__ __device__ void apply_alibi(Tensor<Engine, Layout> &tensor,
+                                       const int col_idx_offset_,
+                                       const int row_idx_offset,
+                                       const int warp_row_stride) {
+-        // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
++        // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N)); the bias is per key, the same for every row
+         static_assert(Layout::rank == 2, "Only support 2D Tensor");
+-        const int lane_id = threadIdx.x % 32;
+-        const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+-        if constexpr (Is_causal) {  // Simpler, we add the same bias vector to all rows
+-            #pragma unroll
+-            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+-                const int col_idx_base = col_idx_offset + nj * 8;
+-                #pragma unroll
+-                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+-                    const int col_idx = col_idx_base + j;
+-                    #pragma unroll
+-                    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+-                        tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
+-                    }
+-                }
+-            }
+-        } else {  // Bias depends on both row_idx and col_idx
++        static_assert(decltype(size<1>(tensor))::value == kNColThr, "prefetched bias columns must match the tile");
++        #pragma unroll
++        for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+             #pragma unroll
+-            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+-                const int row_idx_base = row_idx_offset + mi * warp_row_stride;
++            for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                 #pragma unroll
+-                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+-                    const int row_idx = row_idx_base + i * 8;
+-                    #pragma unroll
+-                    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+-                        const int col_idx_base = col_idx_offset + nj * 8;
+-                        #pragma unroll
+-                        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+-                            const int col_idx = col_idx_base + j;
+-                            tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+-                        }
+-                    }
++                for (int mi = 0; mi < size<0>(tensor); ++mi) {
++                    tensor(mi, make_coord(j, nj)) += kb[j + 2 * nj];
+                 }
+             }
+         }
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_bwd_kernel.h work/csrc/flash_attn/src/flash_bwd_kernel.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_bwd_kernel.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/flash_bwd_kernel.h	2026-09-09 00:16:00.939249056 -0700
+@@ -449,12 +449,20 @@
+     clear(acc_dv);
+     clear(acc_dk);
+ 
+-    const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+-    FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
++    const float *key_bias = !Has_alibi || params.alibi_slopes_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.alibi_slopes_ptr) + bidb * params.alibi_slopes_batch_stride + bidh * params.alibi_slopes_head_stride;
++    FLASH_NAMESPACE::Alibi<Is_causal, 4 * MMA_N_SdP> alibi(key_bias, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
++
++    // d(loss)/d(key bias in raw-score units): softmax_scale times the column sums of dS over every
++    // query row this block sees, kept per thread across the m_block loop and reduced once at the end.
++    Tensor acc_s_proto = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});
++    Tensor scores_proto = make_tensor(acc_s_proto.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s_proto.layout()));
++    Tensor dbias_acc = make_fragment_like<float>(scores_proto(0, _));
++    clear(dbias_acc);
+ 
+     for (; m_block >= m_block_min; --m_block) {
+         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
+         clear(acc_s);
++        if constexpr (Has_alibi) { alibi.prefetch(n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16); }
+         cute::cp_async_wait<0>();
+         __syncthreads();
+ 
+@@ -587,6 +595,7 @@
+             #pragma unroll
+             for (int ni = 0; ni < size<1>(dS); ++ni) {
+                 float scaled_ds = pointwise_mult(scores(mi, ni), dS(mi, ni), dP_sum(mi));
++                if constexpr (Has_alibi) { dbias_acc(ni) += scaled_ds; }
+                 if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
+                 dS(mi, ni) = scaled_ds;
+             }
+@@ -721,6 +730,25 @@
+ 
+     }
+ 
++    if constexpr (Has_alibi) {
++        if (params.dbias_ptr != nullptr) {
++            const int lane_id = tidx % 32;
++            const int col_base = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
++            float *dbias = reinterpret_cast<float *>(params.dbias_ptr) + bidb * params.dbias_batch_stride + bidh * params.dbias_head_stride;
++            #pragma unroll
++            for (int ni = 0; ni < size(dbias_acc); ++ni) {
++                float v = dbias_acc(ni);
++                v += __shfl_xor_sync(0xffffffff, v, 4);
++                v += __shfl_xor_sync(0xffffffff, v, 8);
++                v += __shfl_xor_sync(0xffffffff, v, 16);
++                if (lane_id < 4) {
++                    const int col_idx = col_base + (ni / 2) * 8 + (ni % 2);
++                    if (col_idx < binfo.actual_seqlen_k) { atomicAdd(dbias + col_idx, v * params.scale_softmax); }
++                }
++            }
++        }
++    }
++
+     // Epilogue
+ 
+     if (Is_dropout) {
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_fwd_kernel.h work/csrc/flash_attn/src/flash_fwd_kernel.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_fwd_kernel.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/flash_fwd_kernel.h	2026-09-09 00:15:36.956178970 -0700
+@@ -284,8 +284,8 @@
+ 
+     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+ 
+-    const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
++    const float *key_bias = !Has_alibi || params.alibi_slopes_ptr == nullptr ? nullptr : reinterpret_cast<float *>(params.alibi_slopes_ptr) + bidb * params.alibi_slopes_batch_stride + bidh * params.alibi_slopes_head_stride;
++    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi, kBlockN / 4> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, key_bias);
+ 
+     // For performance reason, we separate out two kinds of iterations:
+     // those that need masking on S, and those that don't.
+@@ -302,6 +302,7 @@
+     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
++        mask.prefetch(n_block * kBlockN);
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+ 
+@@ -378,6 +379,7 @@
+     for (; n_block >= n_block_min; --n_block) {
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
++        mask.prefetch(n_block * kBlockN);
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+@@ -835,8 +837,8 @@
+ 
+     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+ 
+-    const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
++    const float *key_bias = !Has_alibi ? nullptr : reinterpret_cast<float *>(params.alibi_slopes_ptr) + bidb * params.alibi_slopes_batch_stride + bidh * params.alibi_slopes_head_stride;
++    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi, kBlockN / 4> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, key_bias);
+ 
+     // For performance reason, we separate out two kinds of iterations:
+     // those that need masking on S, and those that don't.
+@@ -853,6 +855,7 @@
+     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
++        mask.prefetch(n_block * kBlockN);
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+ 
+@@ -937,6 +940,7 @@
+     for (; n_block >= n_block_min; --n_block) {
+         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+         clear(acc_s);
++        mask.prefetch(n_block * kBlockN);
+         FLASH_NAMESPACE::cp_async_wait<0>();
+         __syncthreads();
+         // Advance gV
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_fwd_launch_template.h work/csrc/flash_attn/src/flash_fwd_launch_template.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_fwd_launch_template.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/flash_fwd_launch_template.h	2026-09-09 00:29:17.845582821 -0700
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ #include "namespace_config.h"
++#include <cstdlib>
++#include <cstring>
+ #include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
+ 
+ #include "static_switch.h"
+@@ -237,7 +239,18 @@
+                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                 }
+             } else {
+-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
++                // With the key bias the stock 128x64 tile runs at 255 registers and spills; 128x32 measured
++                // fastest for the biased launches on an A100 (rishabh/bench/probe_keybias.py: 1.11x plain at
++                // 22k tokens against 1.21x). FA2BIAS_FWD_TILE = 128x64 | 64x64 | 128x32 overrides.
++                const char *tile = params.alibi_slopes_ptr != nullptr ? std::getenv("FA2BIAS_FWD_TILE") : nullptr;
++                const bool biased = params.alibi_slopes_ptr != nullptr;
++                if (tile != nullptr && std::strcmp(tile, "64x64") == 0) {
++                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
++                } else if (biased && (tile == nullptr || std::strcmp(tile, "128x32") == 0)) {
++                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
++                } else {
++                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
++                }
+             }
+             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+             // run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, true, T>, Is_dropout, Is_causal>(params, stream);
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash.h work/csrc/flash_attn/src/flash.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/flash.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/flash.h	2026-09-08 23:19:01.179252639 -0700
+@@ -137,6 +137,7 @@
+ 
+     void * __restrict__ alibi_slopes_ptr;
+     index_t alibi_slopes_batch_stride;
++    index_t alibi_slopes_head_stride;
+ 
+     bool unpadded_lse;  // For varlen paths: LSE is in [nheads, total_seqlen_q] format instead of [b, nheads, seqlen_q].
+     bool seqlenq_ngroups_swapped;  // q has been transposed from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d).
+@@ -180,6 +181,10 @@
+     // The pointer to the softmax d sum.
+     void *__restrict__ dsoftmax_sum;
+ 
++    void *__restrict__ dbias_ptr;
++    index_t dbias_batch_stride;
++    index_t dbias_head_stride;
++
+     bool deterministic;
+     index_t dq_accum_split_stride;
+ };
+diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/mask.h work/csrc/flash_attn/src/mask.h
+--- flash_attn-2.8.3.post1/csrc/flash_attn/src/mask.h	2026-06-10 21:34:21.000000000 -0700
++++ work/csrc/flash_attn/src/mask.h	2026-09-09 00:15:36.950178953 -0700
+@@ -108,21 +108,36 @@
+     }
+ }
+ 
+-template <bool Is_causal, bool Is_local, bool Has_alibi>
++template <bool Is_causal, bool Is_local, bool Has_alibi, int kNColThr = 1>
+ struct Mask {
+ 
+     const int max_seqlen_k, max_seqlen_q;
+     const int window_size_left, window_size_right;
+-    const float alibi_slope;
++    const float * __restrict__ key_bias;
++    float kb[kNColThr];
++
++    // Load this thread's bias values for the block starting at col_idx_offset_ into registers;
++    // called before the QK gemm so the latency hides under it.
++    __forceinline__ __device__ void prefetch(const int col_idx_offset_) {
++        if constexpr (Has_alibi) {
++            const int lane_id = threadIdx.x % 32;
++            const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
++            #pragma unroll
++            for (int ni = 0; ni < kNColThr; ++ni) {
++                const int col_idx = col_idx_offset + (ni / 2) * 8 + (ni % 2);
++                kb[ni] = col_idx < max_seqlen_k ? key_bias[col_idx] : 0.f;
++            }
++        }
++    }
+ 
+     __forceinline__ __device__ Mask(const int max_seqlen_k, const int max_seqlen_q,
+                                     const int window_size_left, const int window_size_right,
+-                                    const float alibi_slope=0.f)
++                                    const float *key_bias=nullptr)
+         : max_seqlen_k(max_seqlen_k)
+         , max_seqlen_q(max_seqlen_q)
+         , window_size_left(window_size_left)
+         , window_size_right(window_size_right)
+-        , alibi_slope(!Has_alibi ? 0.0 : alibi_slope) {
++        , key_bias(key_bias) {
+     };
+ 
+     // Causal_mask: whether this particular iteration needs causal masking
+@@ -139,8 +154,9 @@
+         if constexpr (Need_masking) {
+             // Reshape tensor_ from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+             Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
++            static_assert(!Has_alibi || decltype(size<1>(tensor))::value == kNColThr, "prefetched bias columns must match the tile");
+             // Do we need both row and column indices, or just column incides?
+-            static constexpr bool Col_idx_only = !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
++            static constexpr bool Col_idx_only = !Is_local && !Causal_mask;
+             const int lane_id = threadIdx.x % 32;
+             const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+             if constexpr (Col_idx_only) {
+@@ -154,7 +170,7 @@
+                         for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                             // No causal, no local
+                             if constexpr (Has_alibi) {
+-                                tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
++                                tensor(mi, make_coord(j, nj)) += kb[j + 2 * nj];
+                             }
+                             if constexpr (!Is_even_MN) {
+                                 if (col_idx >= max_seqlen_k) { tensor(mi, make_coord(j, nj)) = -INFINITY; }
+@@ -178,12 +194,7 @@
+                             for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                                 const int col_idx = col_idx_base + j;
+                                 if constexpr (Has_alibi) {
+-                                    if constexpr (Is_causal) {
+-                                        tensor(make_coord(i, mi), make_coord(j, nj)) += alibi_slope * col_idx;
+-                                    } else {
+-                                        tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
+-
+-                                    }
++                                    tensor(make_coord(i, mi), make_coord(j, nj)) += kb[j + 2 * nj];
+                                 }
+                                 if constexpr (Causal_mask) {
+                                     if (col_idx >= col_idx_limit_right) {

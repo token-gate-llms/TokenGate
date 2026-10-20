@@ -1,0 +1,12 @@
+# TokenGate benchmark config: Kamradt needle-in-a-haystack on Qwen3-1.7B
+# (16k-token training tier; --split val = 50 eval rows, test = 150 held-out).
+# Prepare the store first: generate_niah_kamradt.py + niah_kamradt/prepare.py.
+base_model: Qwen/Qwen3-1.7B
+task: niah_kamradt
+gate_layer: 1
+checkpoint: liana313/tokengate-niah-qwen3-1.7b
+dataset: niah_kamradt
+eval_split: tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json
+k_values: [100, 500, 2000]
+max_new_tokens: 32
+gate_attn: fa2        # flex avoids the custom kernel build (slower)

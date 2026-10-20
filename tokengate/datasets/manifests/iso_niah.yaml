@@ -1,0 +1,12 @@
+version: iso_niah
+created: '2026-10-04'
+note: Single-target manifest for the isolated (iso) protocol.
+datasets:
+- dataset: niah_kamradt
+  task: niah_kamradt
+  prompt_version: niah_v1
+  source_hf: 'generated: PG-essay haystack + Kamradt (2023) canonical needle (generate_niah_kamradt.py)'
+  n_train_post_filter: 12000
+  ctx_mean: 15157.8
+  ans_mean: 13.8
+  metric: acc

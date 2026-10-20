@@ -1,0 +1,14 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SINGLE-TARGET map: train ONLY the longbench_2wikimqa pool (isolated 2wiki run —
+# see run_e2e_mlpgate_pretrain_2wiki_iso_frozen.sh). Same row-uniform
+# target-balanced sampler semantics as eval_target_train_map_v16.yaml: every
+# (dataset, task) NOT listed gets weight 0. Pool copied verbatim from the v16
+# map (single member, 20k in-window rows).
+# ─────────────────────────────────────────────────────────────────────────────
+version: v16_2wiki_only
+manifest: iso_2wiki
+eval_split_manifest: tokengate/datasets/eval_splits/longbench_eval_split_2wikimqa_iso_v1.json
+
+targets:
+  longbench_2wikimqa:
+    - {dataset: mfqa_2wiki_wiki, task: multihop_style}

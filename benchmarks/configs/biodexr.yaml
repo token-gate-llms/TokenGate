@@ -1,0 +1,16 @@
+# TokenGate benchmark config: BioDEX-Reactions on Qwen3-1.7B
+# (exact-match set F1; --split val = 50 eval rows, test = 450 held-out).
+# Prepare the store first: datasets/biodex/biodex_reactions/prepare.py.
+# Copy this file to benchmark another dataset: point `task` at a registered
+# task (tokengate/datasets/tasks) and `checkpoint` at a trained run dir (or a
+# HF Hub repo holding the gate + name-paired adapter); samples come from the
+# prepared store + eval-split manifest (or set `samples: <jsonl>` instead).
+base_model: Qwen/Qwen3-1.7B
+task: biodex_reactions
+gate_layer: 1
+checkpoint: liana313/tokengate-biodexr-qwen3-1.7b
+dataset: biodex
+eval_split: tokengate/datasets/eval_splits/longbench_eval_split_biodexr_iso_v1.json
+k_values: [500, 1000, 2000]
+max_new_tokens: 64
+gate_attn: fa2        # flex avoids the custom kernel build (slower)

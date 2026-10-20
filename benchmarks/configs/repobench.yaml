@@ -1,0 +1,12 @@
+# TokenGate benchmark config: RepoBench-P cross-file code completion on
+# Qwen3-1.7B (edit-similarity metric; --split val = 50 eval rows, test = 450
+# held-out). Prepare the store first: longbench_repobench_p/prepare.py.
+base_model: Qwen/Qwen3-1.7B
+task: longbench_repobench_p
+gate_layer: 1
+checkpoint: liana313/tokengate-repobench-qwen3-1.7b
+dataset: longbench-datasets
+eval_split: tokengate/datasets/eval_splits/longbench_eval_split_repobench_iso_v1.json
+k_values: [500, 1000, 2000]
+max_new_tokens: 64
+gate_attn: fa2        # flex avoids the custom kernel build (slower)

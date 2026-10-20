@@ -1,0 +1,24 @@
+version: iso_2wiki
+created: '2026-10-04'
+note: Single-target manifest for the isolated (iso) protocol. Eval pair longbench_2wikimqa
+  rides as eval_only (it is never trained).
+datasets:
+- dataset: mfqa_2wiki_wiki
+  task: multihop_style
+  prompt_version: v0
+  source_hf: framolfese/2WikiMultihopQA questions + full-Wikipedia reconstructed contexts
+  n_train_post_filter: 20000
+  metric: F1
+  note: '2wikimqa full-Wikipedia multi-hop twin. Two-layer decontam: question-exact +
+    (q,a) 13-gram residual.'
+eval_only_datasets:
+- dataset: longbench-datasets
+  task: longbench_2wikimqa
+  prompt_version: longbench_v1
+  subset: 2wikimqa
+  reason: "TARGET held-out \u2014 trained only via the mfqa_2wiki_wiki twin; eval the real\
+    \ LongBench split"
+  n_val: 10
+  category: qa
+  eval_group: qa_heldout
+  metric: F1

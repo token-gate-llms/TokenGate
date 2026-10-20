@@ -1,0 +1,25 @@
+version: iso_niah32k
+created: '2026-10-04'
+note: 'Bench-only manifest for the long-context NIAH tier: niah_kamradt as the trained pair (pack-safe;
+  keeps the synthetic_heldout group label) + the tier as eval_only (test-only store, no train.pkl).'
+datasets:
+- dataset: niah_kamradt
+  task: niah_kamradt
+  prompt_version: niah_v1
+  source_hf: 'generated: PG-essay haystack + Kamradt (2023) canonical needle (generate_niah_kamradt.py)'
+  n_train_post_filter: 12000
+  ctx_mean: 15157.8
+  ans_mean: 13.8
+  metric: acc
+eval_only_datasets:
+- dataset: niah_kamradt_32k
+  task: niah_kamradt_32k
+  prompt_version: niah_v1
+  subset: null
+  reason: "32k-token test-only tier (2x the 16k training tier; same held-out cities/needles, seed 0) \u2014\
+    \ length-generalization benchmark for the SAME niah checkpoints (generate_niah_kamradt.py --n-train\
+    \ 0 --test-target 32000)"
+  n_val: 200
+  category: synthetic
+  eval_group: niah_heldout
+  metric: acc

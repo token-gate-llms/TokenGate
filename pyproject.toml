@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tokengate"
+version = "0.1.0"
+description = "TokenGate: The Missing Module For Fast And Memory-Efficient Prefill In LLMs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.9",
+    "transformers>=5.5,<6",
+    "datasets>=2.18.0",
+    "huggingface-hub>=0.24",
+    "numpy>=2.0",
+    "tqdm>=4.66",
+    "pyyaml>=6.0",
+    "safetensors>=0.4.0",
+]
+
+[project.optional-dependencies]
+# Training-run logging + curve plots (the trainer runs without them).
+train = ["wandb>=0.16", "matplotlib>=3.8"]
+# Metrics + data prep for specific datasets.
+data = ["rouge-score>=0.1.2", "pyarrow>=15.0"]
+
+[project.urls]
+Repository = "https://github.com/liana313/cleaned-token-gate"
+
+[tool.hatch.build.targets.wheel]
+packages = ["tokengate"]
+# Manifests, eval splits and sampling maps ship with the package (the code
+# resolves them relative to tokengate/datasets/).
+artifacts = [
+    "tokengate/datasets/manifests/*.yaml",
+    "tokengate/datasets/eval_splits/*.json",
+    "tokengate/datasets/maps/*.yaml",
+]

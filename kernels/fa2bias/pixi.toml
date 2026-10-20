@@ -1,0 +1,23 @@
+[workspace]
+name = "fa2bias"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+cuda-version = "12.8.*"
+cuda-nvcc = "12.8.*"
+cuda-cudart-dev = "12.8.*"
+cuda-cccl = "12.8.*"
+gxx = "13.*"
+ninja = "*"
+setuptools = "*"
+pip = "*"
+
+[pypi-dependencies]
+torch = "==2.9.1"
+packaging = "*"
+psutil = "*"
+
+[tasks]
+build = "python build.py"
