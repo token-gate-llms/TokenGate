@@ -27,7 +27,7 @@ train = ["wandb>=0.16", "matplotlib>=3.8"]
 data = ["rouge-score>=0.1.2", "pyarrow>=15.0"]
 
 [project.urls]
-Repository = "https://github.com/liana313/cleaned-token-gate"
+Repository = "https://github.com/tokengate-models/TokenGate"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tokengate"]
