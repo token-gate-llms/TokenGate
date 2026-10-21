@@ -78,8 +78,10 @@ class _StaticStoreLayer(DynamicLayer):
     """A cache layer whose first write copies K/V into a static buffer (and
     exposes views of it), so a captured graph's cache lands at fixed addresses."""
 
-    def __init__(self, config, buf_k, buf_v):
-        super().__init__(config)
+    def __init__(self, buf_k, buf_v):
+        # No-arg super(): DynamicLayer's __init__ signature differs across
+        # transformers 5.x, and every field it would set is overwritten here.
+        super().__init__()
         self.buf_k, self.buf_v = buf_k, buf_v
         self.keys = buf_k[:, :, :0]
         self.values = buf_v[:, :, :0]
@@ -138,13 +140,12 @@ def _bufs(model, first_layer, B, dtype, device):
 def _static_cache(model, first_layer, B, dtype, device):
     """A PrefillCache whose layers >= first_layer store into the model's static
     K/V buffers (allocated once per batch size)."""
-    cfg = model.config.get_text_config(decoder=True)
     kv, hs_out, _, _ = _bufs(model, first_layer, B, dtype, device)
     cache = PrefillCache(model.config)
     for i in range(first_layer, len(model.model.layers)):
         if type(cache.layers[i]).__name__ not in ("DynamicLayer", "_StoreFirstLayer"):
             continue
-        cache.layers[i] = _StaticStoreLayer(cfg, *kv[i])
+        cache.layers[i] = _StaticStoreLayer(*kv[i])
     return cache, hs_out
 
 

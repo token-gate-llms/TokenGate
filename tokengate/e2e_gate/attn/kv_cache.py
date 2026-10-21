@@ -29,6 +29,9 @@ class _StoreFirstLayer(DynamicLayer):
 class PrefillCache(DynamicCache):
     def __init__(self, config):
         super().__init__(config=config)
-        decoder_config = config.get_text_config(decoder=True)
-        self.layers = [_StoreFirstLayer(decoder_config) if type(layer) is DynamicLayer else layer
-                       for layer in self.layers]
+        # Swap the class in place rather than constructing replacements:
+        # DynamicLayer's __init__ signature differs across transformers 5.x,
+        # and _StoreFirstLayer adds no state of its own.
+        for layer in self.layers:
+            if type(layer) is DynamicLayer:
+                layer.__class__ = _StoreFirstLayer
