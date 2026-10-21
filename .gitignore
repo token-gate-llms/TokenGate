@@ -48,8 +48,6 @@ tokengate/datasets/indexes/
 tokengate/datasets/.mfqa_lb_shingles.pkl
 datasets/_wiki_src/
 
-# pixi environment (manifest is the repo-root pixi.toml; roach builds it per clone)
-.pixi/
 
 # NIAH/RULER generated pools + the (copyrighted) PG essay cache — regenerate via
 # datasets/niah_kamradt/generate_niah_kamradt.py
