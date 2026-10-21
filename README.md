@@ -39,9 +39,11 @@ The API mirrors the standard transformers flow (`from_pretrained` /
 `{state}` placeholder marking the prunable document (everything else in the
 prompt is never pruned), and one extra parameter: `max_kept_prefill_tokens`,
 the keep-budget K. Here with the released needle-in-a-haystack gate — a fact
-planted somewhere in ~32,000 tokens of essays:
+planted somewhere in ~32,000 tokens of essays (a sample haystack ships with
+the repo, so this runs as-is):
 
 ```python
+import json
 from transformers import AutoTokenizer
 from tokengate import load_model, apply_chat_template
 
@@ -50,11 +52,14 @@ from tokengate import load_model, apply_chat_template
 model = load_model("liana313/tokengate-niah-qwen3-1.7b")
 tok = AutoTokenizer.from_pretrained(model.base_model)
 
+# ~32k tokens of essays with one planted fact about San Francisco
+essays = json.loads(next(open("examples/data/niah_32k_samples.jsonl")))["body"]
+
 prompt = ("Answer the question using only the document below. "
           "Keep your answer short and direct.\n\n"
           "Question: What is the best thing to do in San Francisco?\n\n"
           "Document:\n{state}\n\nAnswer:")
-ids = apply_chat_template(tok, prompt, state=open("essays.txt").read())
+ids = apply_chat_template(tok, prompt, state=essays)
 
 for k in (None, 2000, 500, 100):          # None = keep every state token
     out = model.generate([ids], tok, max_kept_prefill_tokens=k)
