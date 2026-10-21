@@ -36,13 +36,16 @@ back automatically with a warning; training asks for an explicit
 
 ### Inference
 
-The API mirrors the standard transformers flow (`from_pretrained` /
-`apply_chat_template` / `generate`) — the differences are the import, the
-`{state}` placeholder marking the prunable document (everything else in the
-prompt is never pruned), and one extra parameter: `max_kept_prefill_tokens`,
-the keep-budget K. Here with the released needle-in-a-haystack gate — a fact
-planted somewhere in ~32,000 tokens of essays (a sample haystack ships with
-the repo, so this runs as-is):
+If you're already familiar with 🤗 transformers (`from_pretrained` /
+`apply_chat_template` / `generate`), getting started with TokenGate will be a
+breeze. Two things are new: a `{state}` placeholder marks the prunable
+document in your prompt (everything else is never pruned), and `generate`
+takes a keep-budget `max_kept_prefill_tokens` — the number of state tokens
+that survive into the KV cache.
+
+The example below loads the released needle-in-a-haystack gate and answers a
+question about one fact planted in ~32,000 tokens of essays. The sample
+haystack ships with the repo, so it runs as-is:
 
 ```python
 import json
@@ -81,14 +84,14 @@ time-to-first-token.
 ### Training
 
 Training looks like a TRL/PEFT recipe: a config object plus a trainer that
-takes your dataset. The Qwen3 defaults train on the key-bias kernel
-from [Installation](#-installation); without it the trainer fails fast at
-launch — set `attn_backend="flex"` in the config to train on the no-build
-kernels instead.
+takes your dataset. The example below trains the same needle-in-a-haystack
+gate the inference example uses. First generate the synthetic haystacks:
 
-Here training the needle-in-a-haystack gate the inference example runs
-(generate the synthetic haystacks once with
-`python datasets/niah_kamradt/generate_niah_kamradt.py --output-file niah.jsonl --n-train 12000`):
+```bash
+python datasets/niah_kamradt/generate_niah_kamradt.py --output-file niah.jsonl --n-train 12000
+```
+
+Then train:
 
 ```python
 import json
@@ -121,22 +124,19 @@ trainer.train()                           # → e2e_gates/niah-1p7b/gate_final.p
 ```
 
 Each row is `{"article": <the prunable document>, "answer": <target>}`
-(`"state"` works as an alias for `"article"`; any HF Dataset with those
-columns works). The trainer tokenizes the rows into the standard store
-layout, carves a deterministic eval split from `eval_dataset` (first
-`eval_val_samples` sorted ids in-training, the rest reserved as a test
-partition), and trains. Already-prepared data (the per-dataset `prepare.py`
-layout under `datasets/`) can be passed by name instead —
-`train_dataset="biodex/biodex_reactions"` — with no `eval_dataset`; the
-store's own val split is used.
+(`"state"` is an alias for `"article"`; any HF Dataset with those columns
+works). The trainer tokenizes the rows, carves a deterministic eval split
+from `eval_dataset`, and launches a DDP `torchrun` run on all visible GPUs
+(`num_gpus` overrides), blocking until the final gate and its name-paired
+LoRA land in `output_dir`. Already-prepared data under `datasets/` can be
+passed by name instead — `train_dataset="biodex/biodex_reactions"` — and
+uses the store's own val split.
 
-The gate trains against randomly sampled keep-budgets (the default
-`phase2_loguniform` K source), so one trained gate serves any K at inference.
-`train()` launches a DDP `torchrun` run on all visible GPUs (`num_gpus`
-overrides) and blocks until the final gate and its name-paired LoRA land in
-`output_dir`. Attention kernels resolve from the model family
-(FlashAttention-2 + key-bias fork for dense Qwen3, FlexAttention for
-Qwen3.5); set `attn_backend` explicitly for other models.
+The gate trains against randomly sampled keep-budgets, so one trained gate
+serves any K at inference. The Qwen3 defaults train on the key-bias kernel
+from [Installation](#-installation) and fail fast without it; set
+`attn_backend="flex"` to train on the no-build kernels (the Qwen3.5 hybrid
+defaults to flex, and other model families must set it explicitly).
 
 ## 🔍 How it works
 
