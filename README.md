@@ -16,7 +16,7 @@ Current language models read all tokens of their input context, processing each 
 
 **TokenGate is a drop-in component that extends existing models** (e.g., trained transformers or hybrid architectures) to enable learnable token selection. You can **use it as a replacement to standard fine-tuning or PEFT**. While standard fine-tuning allows models to improve task-specific accuracy, training models with TokenGate allows models to *improve both accuracy and prefill efficiency* for Pareto-optimal inference performance. Training with TokenGate is as simple and efficient as PEFT training.
 
-<p align="center"><img src="assets/results_figure.png" width="50%" alt="TokenGate headline results: up to 11.3× faster TTFT and 3.4× lower peak memory at matched accuracy"></p>
+<p align="center"><img src="assets/results_figure.png" width="70%" alt="TokenGate headline results: up to 11.3× faster TTFT and 3.4× lower peak memory at matched accuracy"></p>
 
 ## 📦 Installation
 
