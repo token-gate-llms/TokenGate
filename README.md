@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/title.png" width="60%" alt="Token-Gated Language Models"></p>
 
 <p align="center"><b>TokenGate lets LLMs <I>skim</I> their inputs to selectively read the context that matters.</b></p>
-<p align="center"><b>Skimming beat full reads: 11x faster prefill with 3x lower memory for efficient long-context processing.</b></p>
+<p align="center"><b>Skimming beat full reads: 11x faster prefill & 3x lower memory for long-context processing.</b></p>
 
 
 <p align="center">
