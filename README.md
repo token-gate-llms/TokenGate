@@ -79,10 +79,7 @@ time-to-first-token.
 ### Training
 
 Training looks like a TRL/PEFT recipe: a config object plus a trainer that
-takes your dataset. The run-defining hyperparameters are required
-(construction fails loudly on anything missing); the converged recipe —
-Muon for the run and the gate, constant LR after warmup, LoRA on all layers,
-SWA off — is the default. The Qwen3 defaults train on the key-bias kernel
+takes your dataset. The Qwen3 defaults train on the key-bias kernel
 from [Installation](#-installation); without it the trainer fails fast at
 launch — set `attn_backend="flex"` in the config to train on the no-build
 kernels instead.
