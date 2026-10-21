@@ -295,8 +295,7 @@ format, metric, judge config).
 
 ## 📄 Citation
 
-Paper: [TokenGate: Adapting LLMs for Fast and Memory-Efficient Prefill with
-Learned Token Pruning](https://arxiv.org/abs/2610.26754)
+If you find TokenGate useful, please cite our [paper](https://arxiv.org/abs/2610.26754)
 
 ```bibtex
 @article{patel2026tokengate,
