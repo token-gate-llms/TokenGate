@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/title.png" width="60%" alt="Token-Gated Language Models"></p>
 
 <p align="center"><b>LLMs that can <I>skim</I> their context to selectively read the tokens that matter.</b></p>
-<p align="center"><b>Skimming beats full reads: 11x speedups & 3x lower memory for long-context prefill.</b></p>
+<p align="center"><b>Skimming beats full reads: up to 11x speedup & 3x lower memory for long-context prefill.</b></p>
 
 
 <p align="center">
