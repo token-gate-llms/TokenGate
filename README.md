@@ -151,14 +151,11 @@ time-to-first-token and the peak-memory savings come from. Everything outside
 the `{state}` placeholder (instructions, the question, the generated answer)
 is never pruned.
 
-The gate trains end-to-end with plain next-token prediction, jointly with
-the model backbone, which co-adapts through LoRA. **Token-gated attention**
-makes this possible: in the layers above the gate, each kept token's
-importance score is added to its attention logits — equivalently, its
-attention weight is multiplied by a gate value — so the scoring network
-receives gradients through the tokens it selects, the way an MoE router
-learns through its top-*K* experts, even though the top-*K* selection itself
-is non-differentiable.
+The top-*K* selection introduces a challenge for end-to-end training since top-*K is non-differentiable. 
+To address this we introduce *Token-gated attention**, a mechanism which re-weights each kept token's
+attention logic using its token importance score, providing a gradient path for e2e training.
+The gate trains end-to-end with standard next-token prediction, jointly with
+the model backbone.
 
 ## 📊 Reproducing results
 
@@ -275,7 +272,7 @@ checkpoint was trained with exactly this config. (For a synthetic dataset
 with no external download, see the NIAH lanes:
 `datasets/niah_kamradt/generate_niah_kamradt.py`.)
 
-## 📚 Dataset interface
+## 📚 Datasets
 
 Each dataset is a directory `datasets/<dataset>/<task>/` with a
 `prepare.py` that emits rows of `{article (the state), answer, id, metadata}`
@@ -286,17 +283,6 @@ split through an eval-split manifest — the explicit source of eval-set sizes.
 Scoring lives in `tokengate/datasets/tasks/` (one `Task` class per task: prompt
 format, metric, judge config).
 
-## 📁 Repo layout
-
-| Path | What it is |
-| --- | --- |
-| `tokengate/` | the installable package: gate module, patched attention, trainer, decode |
-| `tokengate/datasets/` | dataset lib (loaders, manifests, eval splits, sampling maps) + `tasks/` (per-task prompting + scoring) |
-| `datasets/` | per-dataset `prepare.py` scripts and their tokenized stores (data, not a package) |
-| `examples/` | runnable demo on a released checkpoint + sample data |
-| `train-scripts/` | lane configs + the shared driver (`run_e2e_gate_pretrain.sh`, `e2e_gate_lib.sh`) and multi-node launchers |
-| `kernels/fa2bias/` | FlashAttention-2 per-key-bias fork (training + inference kernel) |
-| `benchmarks/` | accuracy + TTFT benchmark vs standard prefill (script + per-dataset configs) |
 
 ## 📄 Citation
 
