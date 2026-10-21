@@ -1,7 +1,6 @@
 # Roadmap
 
-Planned improvements, roughly in order:
-
+TODOs:
 - [ ] **CI** — GitHub Actions on push/PR: ruff lint + format check, a CPU test job
   (`python -m tokengate.e2e_gate.tests.test_trainer_api`, config validation, import
   checks), and a README link checker. Badges (CI, arXiv, license, HF models) at the
