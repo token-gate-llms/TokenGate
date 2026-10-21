@@ -12,3 +12,4 @@ TODOs:
 - [ ] **Colab quickstart notebook** — the inference quickstart on a free-tier GPU; no
   custom kernel build needed since inference falls back to FlexAttention automatically.
 - [ ] **Full open-source roadmap**
+- [ ] **pixi environment**
