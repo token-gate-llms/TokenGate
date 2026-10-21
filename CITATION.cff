@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you find TokenGate useful, please cite the paper."
+title: "TokenGate: Adapting LLMs for Fast and Memory-Efficient Prefill with Learned Token Pruning"
+authors:
+  - family-names: Patel
+    given-names: Liana
+  - family-names: Ranjan
+    given-names: Rishabh
+  - family-names: Stoica
+    given-names: Ion
+  - family-names: Zaharia
+    given-names: Matei
+  - family-names: Guestrin
+    given-names: Carlos
+repository-code: "https://github.com/tokengate-models/TokenGate"
+license: Apache-2.0
+preferred-citation:
+  type: article
+  title: "TokenGate: Adapting LLMs for Fast and Memory-Efficient Prefill with Learned Token Pruning"
+  authors:
+    - family-names: Patel
+      given-names: Liana
+    - family-names: Ranjan
+      given-names: Rishabh
+    - family-names: Stoica
+      given-names: Ion
+    - family-names: Zaharia
+      given-names: Matei
+    - family-names: Guestrin
+      given-names: Carlos
+  journal: "arXiv preprint arXiv:2610.26754"
+  year: 2026
+  url: "https://arxiv.org/abs/2610.26754"
