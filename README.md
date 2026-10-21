@@ -31,7 +31,7 @@ Recommended: `python kernels/fa2bias/build.py` builds the fast
 FlashAttention-2 key-bias kernel that the dense-Qwen3 defaults use (needs
 `nvcc`). Everything also runs without it via FlexAttention: inference falls
 back automatically with a warning; training asks for an explicit
-`attn_backend="flex"` so a paper-recipe run is never silently slower.
+`attn_backend="flex".
 
 ## 🚀 Quick start
 
