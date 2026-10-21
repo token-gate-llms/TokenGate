@@ -151,14 +151,14 @@ time-to-first-token and the peak-memory savings come from. Everything outside
 the `{state}` placeholder (instructions, the question, the generated answer)
 is never pruned.
 
-The gate trains end-to-end with plain next-token prediction. This is enabled
-by **token-gated attention**, which re-weights attention logits by each
-token's gate score so that gradients flow through the otherwise
-non-differentiable top-*K* selection. Only the gate and a name-paired LoRA
-adapter are trained — the backbone stays frozen, so the cost is comparable to
-standard parameter-efficient fine-tuning. Because the gate trains against
-randomly sampled keep-budgets, a single trained gate serves any *K* at
-inference.
+The gate trains end-to-end with plain next-token prediction, jointly with
+the model backbone, which co-adapts through LoRA. **Token-gated attention**
+makes this possible: in the layers above the gate, each kept token's
+importance score is added to its attention logits — equivalently, its
+attention weight is multiplied by a gate value — so the scoring network
+receives gradients through the tokens it selects, the way an MoE router
+learns through its top-*K* experts, even though the top-*K* selection itself
+is non-differentiable.
 
 ## 📊 Reproducing results
 
