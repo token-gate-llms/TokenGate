@@ -14,7 +14,7 @@
 
 ## ⚡ What is TokenGate?
 
-Current language models read all tokens of their input context, processing each one through all model layers. **TokenGated Language Models can *skim*, selectively processing only context that matters** through learned token selection for **11.3x faster** prefill with **3.4x lower memory** at no accuracy degradation. TokenGate extends existing models to enable conditional computing, akin to MoE layers, but for a different scaling dimension: long-context inputs. 
+Current language models read all tokens of their input context, processing each one through all model layers. **TokenGated Language Models can *skim*, selectively processing only context that matters** through learned token selection for up to **11.3x faster** prefill with **3.4x lower memory** at no accuracy degradation. TokenGate extends existing models to enable conditional computing, akin to MoE layers, but for a different scaling dimension: long-context inputs. 
 
 ## 🔥 Make your LLM a Token-Gated Language Model
 TokenGate is **a drop-in neural network component that extends existing trained models** (e.g., trained transformers or hybrid architectures) to enable learnable token selection with light-weight adaptation. You can **use training with TokenGate as a replacement to standard fine-tuning or PEFT**. While standard fine-tuning allows models to improve task-specific accuracy, training models with TokenGate allows models to *improve both accuracy and prefill efficiency* for Pareto-optimal inference performance. Training with TokenGate is as simple and efficient as PEFT training.
