@@ -7,6 +7,7 @@
 <p align="center">
 <a href="https://arxiv.org/abs/2610.26754">Paper</a> ·
 <a href="#-quick-start">Quick start</a> ·
+<a href="https://colab.research.google.com/drive/10GjvTZJIsjbdJPZHmvcisQKWE5eBn6kD?usp=sharing">Colab notebook</a> ·
 <a href="#-how-it-works">How it works</a> ·
 <a href="#-reproducing-results">Reproducing results</a>
 </p>
@@ -35,18 +36,34 @@ back automatically with a warning; training asks for an explicit
 
 ## 🚀 Quick start
 
-### Inference
+Choose the Colab notebook for a guided experiment, or the Python example below
+for a compact comparison across token budgets. Both load the same trained model and
+ask it to retrieve a fact from the same ~32,000-token document.
 
-If you're already familiar with 🤗 transformers (`from_pretrained` /
-`apply_chat_template` / `generate`), getting started with TokenGate will be a
-breeze. Two things are new: a `{state}` placeholder marks the prunable
-document in your context, and `generate`
-takes a keep-budget `max_kept_prefill_tokens` — the number of state tokens
-that are retained for full processing during prefill.
+### Explore the example in Colab
 
-The example below loads the released needle-in-a-haystack checkpoint and answers a
-question about one fact planted in ~32,000 tokens of essays. The sample
-haystack ships with the repo, so it runs as-is:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/10GjvTZJIsjbdJPZHmvcisQKWE5eBn6kD?usp=sharing)
+
+The notebook asks: **how much of the document can TokenGate discard while
+still retrieving the answer, and how does that affect prefill time?** You vary
+the document token budget K, check the answers, compare plots of tokens kept
+and prefill time, and inspect the text the gate selected.
+
+The notebook handles installation and loads the trained checkpoint. Select a
+CUDA GPU runtime with native BF16 support (T4 is not supported), then run the
+cells in order.
+
+### Run the example in Python
+
+The example below asks the same question at four document token budgets and
+prints the answer and prefill time for each. The model weights stay fixed;
+only K changes. After [installation](#-installation), run it from the
+repository root on a compatible CUDA GPU.
+
+The `{state}` placeholder marks the document the gate may prune.
+`max_kept_prefill_tokens` sets K; `None` keeps every document token. The
+question and instructions remain available at every budget. K limits retained
+document tokens, not the length of the generated answer.
 
 ```python
 import json
@@ -78,15 +95,21 @@ for k in (None, 2000, 500, 100):          # None = keep every state token
 # 100     130 ms   eat a sandwich and sit in Dolores Park on a sunny day
 ```
 
-One gate serves every K: the planted needle is still answered verbatim with
-144 of 32,191 prompt tokens (0.4%) in the KV cache, at ~11× lower
-time-to-first-token.
+In the example output, the answer stays the same down to K = 100, while
+prefill time falls from 1,471 ms to 130 ms. Timings depend on the GPU,
+attention backend, and kernel warmup.
 
-### Training
+The notebook expands this comparison with more budgets, warmup runs, repeated
+timing measurements, answer checks, and plots. It uses FlexAttention so it can
+run without a custom kernel build. The
+[benchmark examples](#benchmark-examples) extend the evaluation to more documents.
 
-Training looks like a TRL/PEFT recipe: a config object plus a trainer that
-takes your dataset. The example below trains the same needle-in-a-haystack
-gate the inference example uses. First generate the synthetic haystacks:
+## Training
+
+To train your own gate, use `TokenGateConfig` and `TokenGateTrainer`. This
+example trains a gate for the same needle-in-a-haystack task used above.
+Install the training dependencies with `uv pip install -e ".[train]"`, then
+generate the synthetic documents:
 
 ```bash
 python datasets/niah_kamradt/generate_niah_kamradt.py --output-file niah.jsonl --n-train 12000
