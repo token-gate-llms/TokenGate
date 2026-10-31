@@ -9,7 +9,5 @@ TODOs:
   and a `[train]` extra. Prerequisite: the `kernels.fa2bias` import path resolves from
   the repo root today, so a non-editable wheel install breaks on it — move the kernel
   sources under the package (or make the import optional with the flex fallback) first.
-- [ ] **Colab quickstart notebook** — the inference quickstart on a free-tier GPU; no
-  custom kernel build needed since inference falls back to FlexAttention automatically.
 - [ ] **Full open-source roadmap**
 - [ ] **pixi environment**
