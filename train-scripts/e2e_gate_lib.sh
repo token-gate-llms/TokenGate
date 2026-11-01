@@ -12,7 +12,9 @@
 # ── Shared defaults (override in dataset script before sourcing) ───────────────
 : "${PYTHON:=python3}"   # point at your env (conda/venv) for real runs
 : "${NUM_GPUS:=8}"
-: "${WANDB_PROJECT:=fast-context}"
+# An explicitly empty value disables W&B logging (useful for offline runs
+# without the optional wandb package). Only an unset variable gets the default.
+: "${WANDB_PROJECT=fast-context}"
 : "${EVAL_GEN_BATCH_SIZE:=1}"
 : "${SCALAR_LR_MULT:=1}"
 : "${LOG_EXAMPLES:=20}"

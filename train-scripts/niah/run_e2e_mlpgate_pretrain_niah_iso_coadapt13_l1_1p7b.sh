@@ -50,7 +50,9 @@ NO_DECAY_SCALARS=1                    # weight decay on the two branch matrices 
 K_EVAL_VALUES="2000"   # 16k tier: K2000 keeps ~12.5% of article tokens
 EVAL_SPLIT_MANIFEST="tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json"
 EVAL_GROUP_OVERRIDE="niah:niah_kamradt"
-EVAL_TEST_FULL_TASKS="niah_kamradt:niah_heldout"
+# Set to an empty string for a strict held-out benchmark. The original lane
+# evaluated the reserved partition during training for diagnostics.
+EVAL_TEST_FULL_TASKS="${EVAL_TEST_FULL_TASKS-niah_kamradt:niah_heldout}"
 MULTITASK_SUFFIX="-mlpgate-niah-iso-coadapt13l1-rqslu"
 GATE_LAYERS="1"
 export GATE_LAYERS
@@ -68,6 +70,6 @@ export LR_VALUES EPOCHS EVAL_FREQ SWA_FREQ SWA_START TARGET_BALANCED_MAP
 export K_EVAL_VALUES SWA_EVAL_FREQ NUM_GPUS MULTITASK_SUFFIX
 
 echo "[niah-iso] data: niah_kamradt/niah_kamradt via ${TARGET_BALANCED_MAP##*/}"
-echo "[niah-iso] eval: val 16 as cat_niah + test 184 as niah_heldout, every ${EVAL_FREQ} steps, K=${K_EVAL_VALUES}, gate layer ${GATE_LAYERS}"
+echo "[niah-iso] eval split: ${EVAL_SPLIT_MANIFEST}, test diagnostic=${EVAL_TEST_FULL_TASKS:-off}, every ${EVAL_FREQ} steps, K=${K_EVAL_VALUES}, gate layer ${GATE_LAYERS}"
 
 bash train-scripts/run_e2e_gate_pretrain.sh
