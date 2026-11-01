@@ -59,8 +59,8 @@ EVAL_GROUP_OVERRIDE="niah:niah_kamradt"
 # Leave the reserved test partition unseen during a reproduction run when
 # EVAL_TEST_FULL_TASKS is explicitly set to an empty string by the launcher.
 EVAL_TEST_FULL_TASKS="${EVAL_TEST_FULL_TASKS-niah_kamradt:niah_heldout}"
-MULTITASK_SUFFIX="-mlpgate-niah-iso-coadapt17l1d-rqslu"
-GATE_LAYERS="1"             # DeltaNet layer; bias lands on the 6 full-attn layers above
+GATE_LAYERS="${GATE_LAYERS:-1}" # Layer 1: DeltaNet; layer 3: full attention
+MULTITASK_SUFFIX="-mlpgate-niah-iso-coadapt17l${GATE_LAYERS}-rqslu"
 export GATE_LAYERS
 export WANDB_TAGS="coadapt,coadapt17l1d,niah,layersweep,rmsnorm,learnS,lusamp,2b,qwen3p5,hybrid"
 CHECKPOINT_KEEP_ALL_AFTER_WARMUP=1    # keep every gate/adapter ckpt past warmup (train_state stays keep-last-3)

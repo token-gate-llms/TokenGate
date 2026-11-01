@@ -15,7 +15,7 @@ export PRETRAIN_DATA_ROOT="$DATA_ROOT" EVAL_TEST_FULL_TASKS="" CHECKPOINT_BEST_G
 export NUM_GPUS=4
 
 run_recipe() {
-    local label="$1" python="$2" lane="$3" steps="$4"
+    local label="$1" python="$2" lane="$3" steps="$4" layer="${5:-1}"
     local out="$RUN_ROOT/$label"
     mkdir -p "$out"
     echo "[$(date -u +%FT%TZ)] waiting for four idle A100s for $label" | tee -a "$RUN_ROOT/status.log"
@@ -24,7 +24,8 @@ run_recipe() {
         2>> "$RUN_ROOT/status.log")"
     echo "[$(date -u +%FT%TZ)] $label on GPUs $CUDA_VISIBLE_DEVICES" | tee -a "$RUN_ROOT/status.log"
     nvidia-smi --query-gpu=index,name,memory.free,utilization.gpu --format=csv,noheader > "$out/gpu_start.csv"
-    export PYTHON="$python" E2E_GATE_OUTPUT_ROOT="$out/checkpoints" MAX_STEPS="$steps"
+    export PYTHON="$python" E2E_GATE_OUTPUT_ROOT="$out/checkpoints" MAX_STEPS="$steps" GATE_LAYERS="$layer"
+    if [[ "$layer" == 3 ]]; then export GRAD_CHECKPOINT=1; else export GRAD_CHECKPOINT=0; fi
     export TORCHINDUCTOR_CACHE_DIR="$out/inductor"
     mkdir -p "$TORCHINDUCTOR_CACHE_DIR"
     (cd "$ROOT" && bash "$lane") > "$out/train.log" 2>&1
@@ -41,7 +42,11 @@ run_recipe qwen3_smoke "$QWEN3_PYTHON" \
     train-scripts/niah/run_e2e_mlpgate_pretrain_niah_iso_coadapt13_l1_1p7b.sh 2
 run_recipe qwen35_smoke "$QWEN35_PYTHON" \
     train-scripts/niah-qwen3p5/run_e2e_mlpgate_pretrain_niah_iso_coadapt17_l1d_qwen3pt5.sh 2
+run_recipe qwen35_layer3_smoke "$QWEN35_PYTHON" \
+    train-scripts/niah-qwen3p5/run_e2e_mlpgate_pretrain_niah_iso_coadapt17_l1d_qwen3pt5.sh 2 3
 run_recipe qwen3_step3000 "$QWEN3_PYTHON" \
     train-scripts/niah/run_e2e_mlpgate_pretrain_niah_iso_coadapt13_l1_1p7b.sh 3000
 run_recipe qwen35_step18000 "$QWEN35_PYTHON" \
     train-scripts/niah-qwen3p5/run_e2e_mlpgate_pretrain_niah_iso_coadapt17_l1d_qwen3pt5.sh 18000
+run_recipe qwen35_layer3_step18000 "$QWEN35_PYTHON" \
+    train-scripts/niah-qwen3p5/run_e2e_mlpgate_pretrain_niah_iso_coadapt17_l1d_qwen3pt5.sh 18000 3
