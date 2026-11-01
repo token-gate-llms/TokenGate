@@ -234,7 +234,7 @@ def training_rows(repo_root: str | Path, output_dir: str | Path,
     """Build a small training pool disjoint from the selected test cities."""
     import random
 
-    path = Path(output_dir) / "niah_training_pool.jsonl"
+    path = Path(output_dir) / f"niah_training_pool_{n_train}_{n_val}_seed{seed}.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         subprocess.run([sys.executable,
