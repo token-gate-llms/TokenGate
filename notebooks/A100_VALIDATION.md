@@ -23,8 +23,22 @@ own optimized kernel stack. Therefore this is an independent consistency
 check, not an exact paper reproduction. The scripts keep the raw logs and
 checkpoint paths for inspection.
 
-An earlier A100 fast-kernel run of the released Qwen3-1.7B checkpoint on 150
-held-out 16k rows reached 150/150 accuracy at K=100 and 10.82× TTFT speedup
-against the unmodified base model. The paper reports 11.3× TTFT speedup at
-matched accuracy for this setting. The new queued run will measure both
-models and their newly trained gates with one documented split and protocol.
+## Completed released-checkpoint inference
+
+The persistent driver finished its two released-checkpoint benchmarks on the
+frozen 150-row NIAH test partition. Each speedup uses the **unmodified** base
+model on the same A100 as its denominator, so it is a consistency check rather
+than the paper's separately LoRA-tuned baseline comparison.
+
+| Model / document length | Plain accuracy / TTFT | Gate K=100 | Gate K=500 | Gate K=2000 |
+| --- | --- | --- | --- | --- |
+| Qwen3-1.7B / 16k | 149/150, 950.7 ms | 150/150, 82.1 ms (11.58×) | 150/150, 70.6 ms (13.46×) | 150/150, 92.9 ms (10.23×) |
+| Qwen3.5-2B / 32k | 150/150, 5314.9 ms | 61/150, 917.1 ms (5.80×) | 128/150, 958.1 ms (5.55×) | 136/150, 1169.8 ms (4.54×) |
+
+These numbers come from `qwen3_release16k/test150.log` and
+`qwen35_release32k/test150.log` under the output root above. The Qwen3.5
+released checkpoint gates at layer 1. The paper's 3.8× matched-accuracy result
+uses a separately trained **layer-3** gate, so the row above does not test that
+claim. Its layer-3 training and inference remain queued with the other training
+stages. As of 2026-11-01 20:51 Pacific, the driver was waiting for four idle
+A100s to begin the short Qwen3 launch check; all eight GPUs were occupied.
