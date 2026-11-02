@@ -252,3 +252,70 @@ def training_rows(repo_root: str | Path, output_dir: str | Path,
                      answer=r["answer"]) for r in rows]
     assert not {r["city"] for r in pool} & set(DEMO_CITIES)
     return convert(pool[n_val:]), convert(pool[:n_val])
+
+
+def release_niah_rows(repo_root: str | Path, output_dir: str | Path,
+                      n_train: int = 12000) -> tuple[list[dict], list[dict]]:
+    """Generate the stated NIAH-only release recipe and frozen eval pool.
+
+    The 200 eval rows contain 50 validation and 150 reserved test IDs. The
+    trainer receives the committed split manifest and sees only the former.
+    """
+    root = Path(repo_root)
+    path = Path(output_dir) / f"niah_release_{n_train}_seed0.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        tmp = path.with_suffix(".incomplete.jsonl")
+        subprocess.run([sys.executable,
+                        str(root / "datasets/niah_kamradt/generate_niah_kamradt.py"),
+                        "--output-file", str(tmp), "--n-train", str(n_train),
+                        "--n-test-cities", "20", "--seed", "0"], check=True)
+        tmp.replace(path)
+
+    split_path = root / "tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json"
+    split = json.loads(split_path.read_text())["niah_kamradt"]
+    val_ids, test_ids = set(split["val"]), set(split["test"])
+    assert len(val_ids) == 50 and len(test_ids) == 150 and not val_ids & test_ids
+    train, eval_rows = [], []
+    with path.open() as f:
+        for line in f:
+            row = json.loads(line)
+            converted = dict(id=row["id"],
+                             article=row["body"] + "\n\nQuestion: " + row["question"],
+                             answer=row["answer"])
+            (train if row["split"] == "train" else eval_rows).append(converted)
+    assert len(train) == n_train and len({r["id"] for r in train}) == n_train
+    assert len(eval_rows) == 200
+    assert {r["id"] for r in eval_rows} == val_ids | test_ids
+    assert not {r["id"] for r in train} & (val_ids | test_ids)
+    return train, eval_rows
+
+
+def release_niah_config_kwargs(repo_root: str | Path, base_model: str,
+                               output_dir: str | Path, data_root: str | Path,
+                               num_gpus: int) -> dict:
+    """Public TokenGateConfig inputs for the stated NIAH-only release recipe."""
+    if num_gpus not in (1, 2, 4):
+        raise ValueError("use 1, 2, or 4 visible A100s for effective batch size 4")
+    root = Path(repo_root)
+    if base_model not in ("Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-2B"):
+        raise ValueError(f"no released NIAH recipe for {base_model}")
+    return dict(
+        base_model=base_model, gate_layer=1, output_dir=str(output_dir),
+        learning_rate=1e-4, epochs=20, max_steps=(3000 if base_model.endswith("1.7B") else 18000),
+        k_eval=[2000], lora_rank=16, lora_alpha=32, lora_lr=1e-4,
+        lora_targets=["q_proj", "v_proj"],
+        num_gpus=num_gpus, batch_size=1, grad_accum=4 // num_gpus,
+        warmup_steps=1000, lr_schedule="constant", optim="muon",
+        gate_optimizer="muon", weight_decay=0.1, no_decay_scalars=True,
+        phase2_loguniform=True, shuffle_epochs=True, seed=0,
+        min_article_tokens=2048, max_article_tokens=16384,
+        eval_min_article_tokens=0, eval_max_article_tokens=39000,
+        eval_freq=600, checkpoint_freq=600, eval_gen_batch_size=1,
+        gate_full_eval_freq=5, swa_freq=1, swa_start=0, swa_eval_freq=1,
+        eval_split=str(root / "tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json"),
+        eval_group_override="niah:niah_kamradt", eval_test_full_tasks=None,
+        target_balanced_map=str(root / "tokengate/datasets/maps/eval_target_train_map_v17_niah_only.yaml"),
+        data_root=str(data_root), packed=True, grad_checkpoint=False,
+        wandb_project=None,
+    )
