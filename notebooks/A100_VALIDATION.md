@@ -42,3 +42,8 @@ uses a separately trained **layer-3** gate, so the row above does not test that
 claim. Its layer-3 training and inference remain queued with the other training
 stages. As of 2026-11-01 20:51 Pacific, the driver was waiting for four idle
 A100s to begin the short Qwen3 launch check; all eight GPUs were occupied.
+
+The optional LoRA-only baseline helper was checked against the prepared
+cluster stores without a GPU: both models exposed 12,000 packed training rows
+and exactly the 50 frozen validation rows, and their input/label padding
+collated successfully. This verifies the data path, not the full training run.
