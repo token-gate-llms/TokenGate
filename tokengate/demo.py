@@ -61,13 +61,19 @@ def niah_examples(repo_root: str | Path, doc_tokens: int = 16384,
     return chosen
 
 
-def niah_prompt(tokenizer, row: dict) -> tuple[list[int], list[int]]:
-    """Return (TokenGate sentinel prompt, ordinary full-context prompt)."""
-    from tokengate import apply_chat_template, split_state_span
+def niah_prompt_text(row: dict) -> str:
+    """Format a NIAH question with the public API's {state} placeholder."""
     from tokengate.datasets.tasks import get_task
 
     task = get_task("niah_kamradt")
-    prompt = task.format_prompt("{state}\n\nQuestion: " + row["question"])
+    return task.format_prompt("{state}\n\nQuestion: " + row["question"])
+
+
+def niah_prompt(tokenizer, row: dict) -> tuple[list[int], list[int]]:
+    """Return (TokenGate sentinel prompt, ordinary full-context prompt)."""
+    from tokengate import apply_chat_template, split_state_span
+
+    prompt = niah_prompt_text(row)
     gated = apply_chat_template(tokenizer, prompt, state=row["body"])
     plain, _, _ = split_state_span(gated)
     return gated, plain
