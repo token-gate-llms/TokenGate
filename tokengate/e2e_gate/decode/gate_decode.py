@@ -144,11 +144,14 @@ def generate_batch(
         # they need their own pad mask (pads at [len_i, S); decode-appended
         # slots valid for all) and their own cache_position (append at S+step).
         S = max(len(p) for p in prompt_ids_list)
-        _first_kv = next(cl for cl in cache.layers[:gate_layer + 1]
-                         if hasattr(cl, "keys") and cl.keys is not None)
-        assert _first_kv.keys.shape[2] == S, (
-            f"below-gate cache width {_first_kv.keys.shape[2]} != phase-1 padded "
-            f"len {S} — prefill/decode disagree about prune_below_gate")
+        _first_kv = next((cl for cl in cache.layers[:gate_layer + 1]
+                          if hasattr(cl, "keys") and cl.keys is not None), None)
+        # Hybrid Qwen3.5 can gate at a DeltaNet layer: every below-gate
+        # cache is recurrent state, with no per-token keys to check here.
+        if _first_kv is not None:
+            assert _first_kv.keys.shape[2] == S, (
+                f"below-gate cache width {_first_kv.keys.shape[2]} != phase-1 padded "
+                f"len {S} — prefill/decode disagree about prune_below_gate")
         below_mask = torch.zeros(B, 1, 1, S + max_new_tokens,
                                  dtype=dec_dtype, device=device)
         for _b, _p in enumerate(prompt_ids_list):
@@ -191,11 +194,12 @@ def generate_batch(
                 bm = below_mask[:, :, :, : below_next + 1]
                 cp_below = torch.tensor([below_next], device=hd)
             for li in range(n_layers):
+                is_linear = getattr(inner.layers[li], "layer_type", None) == "linear_attention"
                 if not prune_below_gate and li <= gate_layer:
                     # full phase-1 cache at this layer: full-width pad mask +
                     # its own append slot (the form fold never covers <= L)
                     hs = inner.layers[li](
-                        hs, attention_mask=bm.to(hd),
+                        hs, attention_mask=None if is_linear else bm.to(hd),
                         position_ids=next_pos.to(hd),
                         past_key_values=cache, use_cache=True,
                         cache_position=cp_below, position_embeddings=pe,
@@ -203,7 +207,7 @@ def generate_batch(
                     continue
                 am = fds.mask_for(li, cache_next + 1) if fds is not None else dm
                 hs = inner.layers[li](
-                    hs, attention_mask=am.to(hd),
+                    hs, attention_mask=None if is_linear else am.to(hd),
                     position_ids=next_pos.to(hd),
                     past_key_values=cache, use_cache=True,
                     cache_position=cp, position_embeddings=pe,

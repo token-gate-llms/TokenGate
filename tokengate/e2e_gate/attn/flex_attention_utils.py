@@ -406,8 +406,8 @@ def flex_attention_segment_gate_bias(
 # are bf16 kernel outputs, so the result carries ~2 bf16 ulps of per-row
 # scale noise where the score_mod path carries one.
 
-CAUSAL_BACKENDS = ("flex", "cudnn", "flash", "fa4", "auto")
-BIAS_BACKENDS = ("flex", "vweight-cudnn", "aug-flash", "aug-fa4", "fa2-bias")
+CAUSAL_BACKENDS = ("sdpa", "flex", "cudnn", "flash", "fa4", "auto")
+BIAS_BACKENDS = ("sdpa", "flex", "vweight-cudnn", "aug-flash", "aug-fa4", "fa2-bias")
 
 # "auto" picks the plain causal kernel by context length: on a b200 cuDNN's
 # fused attention wins below ~12k tokens and FlashAttention's CuTe kernel
@@ -481,6 +481,9 @@ def attention_causal(Q, K, V, backend: str) -> torch.Tensor:
             raise RuntimeError("causal backend 'auto' needs set_attn_crossover(n_tokens) first "
                                "(--attn-crossover in the bench scripts)")
         backend = "fa4" if Q.shape[2] >= _ATTN_CROSSOVER else "cudnn"
+    if backend == "sdpa":
+        from .sdpa_compat import sdpa_causal
+        return sdpa_causal(Q, K, V)
     if backend == "flex":
         return flex_attention_causal(Q, K, V)
     if backend == "cudnn":
@@ -498,6 +501,9 @@ def attention_gate_bias(Q, K, V, gate_bias, per_head: bool, backend: str) -> tor
     gate_bias: (S,) / (B, S) scalar-per-token, or (S, H) / (B, S, H) per head,
     already scaled by whatever attn_scale / ssmax factor the caller applies.
     """
+    if backend == "sdpa":
+        from .sdpa_compat import sdpa_causal
+        return sdpa_causal(Q, K, V, gate_bias, per_head)
     if backend == "flex":
         return flex_attention_gate_bias(Q, K, V, gate_bias, per_head=per_head)
     if backend == "vweight-cudnn":
