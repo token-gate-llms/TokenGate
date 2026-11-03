@@ -262,28 +262,6 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     return time_fig, speed_fig
 
 
-def memory_figure(plain: list[dict], gated: list[dict], *,
-                  baseline_name: str = "Ordinary model"):
-    """Plot peak PyTorch GPU allocation, including model weights, per call."""
-    import matplotlib.pyplot as plt
-    from statistics import mean
-
-    budgets = list(dict.fromkeys(row["budget"] for row in gated))
-    names = ["Baseline", *(f"K={k}" for k in budgets)]
-    peaks = [mean(row["peak_gib"] for row in plain)]
-    peaks += [mean(row["peak_gib"] for row in gated if row["budget"] == k)
-              for k in budgets]
-    fig, ax = plt.subplots(figsize=(7, 3.3))
-    bars = ax.bar(names, peaks, color=["#64748b", *["#296d5c"] * len(budgets)])
-    ax.bar_label(bars, fmt="%.2f GiB", padding=3)
-    ax.set(ylabel="Peak PyTorch GPU allocation (GiB)",
-           title=f"Measured call · {baseline_name}")
-    ax.set_ylim(0, max(peaks) * 1.2)
-    fig.tight_layout()
-    plt.close(fig)
-    return fig
-
-
 def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
                      budget: int = 100):
     """Highlight retained document spans in a scrollable notebook display."""
@@ -370,7 +348,6 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
             print("No tested budget retrieved this fact; inspect the answers or try a larger K.")
         for fig in result_figures(plain, gated, baseline_name=baseline_name):
             display(fig)
-        display(memory_figure(plain, gated, baseline_name=baseline_name))
         print(f"Selected document tokens at K={selected_budget}:")
         show_kept_tokens(gate, tokenizer, gate_prompt, row, budget=selected_budget)
     finally:
