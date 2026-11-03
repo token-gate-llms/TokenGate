@@ -223,12 +223,13 @@ def show_inference_results(plain: list[dict], gated: list[dict]) -> None:
 
 def result_figures(plain: list[dict], gated: list[dict], *,
                    baseline_name: str = "Ordinary model"):
-    """Return separate prefill-time and speedup charts for selected budgets."""
+    """Plot timings only for budgets that answer every sampled question correctly."""
     import matplotlib.pyplot as plt
     from statistics import mean
 
     base_ms = 1000 * mean(r["prefill_s"] for r in plain)
-    budgets = list(dict.fromkeys(r["budget"] for r in gated))
+    budgets = [k for k in dict.fromkeys(r["budget"] for r in gated)
+               if all(r["correct"] for r in gated if r["budget"] == k)]
     gate_ms = [1000 * mean(r["prefill_s"] for r in gated if r["budget"] == k)
                for k in budgets]
     names = [f"K={k}" for k in budgets]
@@ -242,7 +243,7 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     time_ax.bar_label(time_bars, fmt="%.0f ms", padding=3)
     time_ax.set(ylabel="Prefill to first token (ms)",
                 title=f"{scope} · {baseline_name}")
-    time_ax.set_ylim(0, max(base_ms, *gate_ms) * 1.2)
+    time_ax.set_ylim(0, max([base_ms, *gate_ms]) * 1.2)
     time_fig.tight_layout()
 
     speedups = [base_ms / ms for ms in gate_ms]
@@ -252,7 +253,10 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     speed_ax.bar_label(speed_bars, labels=[f"{value:.1f}×" for value in speedups], padding=3)
     speed_ax.set(ylabel="Speedup vs ordinary model",
                  title=f"Same {prompt_label} and GPU · {baseline_name}")
-    speed_ax.set_ylim(0, max(1, *speedups) * 1.2)
+    speed_ax.set_ylim(0, max([1, *speedups]) * 1.2)
+    if not speedups:
+        speed_ax.text(0.5, 0.5, "No correct TokenGate budgets",
+                      transform=speed_ax.transAxes, ha="center", va="center")
     speed_fig.tight_layout()
 
     # Colab auto-renders open Matplotlib figures after the cell. The notebook
