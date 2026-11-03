@@ -187,6 +187,7 @@ def gate_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
                                 correct=task.evaluate(out.answers[0], row["answer"]),
                                 prefill_s=out.prefill_s,
                                 peak_gib=torch.cuda.max_memory_allocated() / 2**30,
+                                kept_pos=list(out.kept_pos[0]),
                                 kept_state=kept_state,
                                 retained=kept_state / (state_end - state_start)))
     return results
@@ -266,24 +267,20 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     return time_fig, speed_fig
 
 
-def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
-                     budget: int = 100):
-    """Highlight retained document spans in a scrollable notebook display."""
+def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
+    """Highlight the document positions saved in a measured gate result."""
     from IPython.display import HTML, display
     from tokengate import split_state_span
 
-    out = model.generate([prompt], tokenizer, max_kept_prefill_tokens=budget,
-                         max_new_tokens=64)
     clean, start, end = split_state_span(prompt)
-    selected = set(out.kept_pos[0])
+    selected = set(result["kept_pos"])
     spans = []
     for keep, positions in groupby(range(start, end), key=lambda p: p in selected):
         piece = html.escape(tokenizer.decode([clean[p] for p in positions]))
         style = "background:#bbf7d0;color:#14532d" if keep else "color:#777"
         spans.append(f'<span style="{style}">{piece}</span>')
-    print(f"{row['city']} · depth {row['depth_actual']:.0%} · "
+    print(f"{row['city']} · depth {row['depth_actual']:.0%} · K={result['budget']} · "
           f"kept {sum(start <= p < end for p in selected):,}/{end-start:,} document tokens")
-    print("Answer:", out.answers[0])
     display(HTML('<div style="max-height:320px;overflow:auto;white-space:pre-wrap;line-height:1.55">'
                  + "".join(spans) + "</div>"))
 
@@ -291,7 +288,7 @@ def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
 def run_niah_exploration(repo_root: str | Path, *, base_model: str,
                          checkpoint_id: str, checkpoint_revision: str,
                          gpu_runtime: str, doc_tokens: int, example_index: int,
-                         budgets: tuple[int, ...], view_budget: int | None = None) -> dict:
+                         budgets: tuple[int, ...]) -> dict:
     """Run one selectable example end to end for the notebook's exploration cell."""
     import gc
 
@@ -304,10 +301,6 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
 
     if not budgets or any(k < 1 for k in budgets):
         raise ValueError("Provide at least one positive token budget")
-    selected_budget = (sorted(budgets)[len(budgets) // 2]
-                       if view_budget is None else view_budget)
-    if selected_budget not in budgets:
-        raise ValueError("The selected-token view budget must be one of the tested budgets")
     if gpu_runtime == "T4" and "Qwen3.5" in base_model and doc_tokens > 8192:
         raise ValueError("Qwen3.5 on T4 supports up to 8k document tokens")
     if gpu_runtime == "A100" and torch.cuda.get_device_properties(0).total_memory < 35 * 2**30:
@@ -352,13 +345,12 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
             print("No tested budget retrieved this fact; inspect the answers or try a larger K.")
         for fig in result_figures(plain, gated, baseline_name=baseline_name):
             display(fig)
-        print(f"Selected document tokens at K={selected_budget}:")
-        show_kept_tokens(gate, tokenizer, gate_prompt, row, budget=selected_budget)
     finally:
         del gate
         gc.collect()
         torch.cuda.empty_cache()
-    return {"sample": row, "plain": plain, "gated": gated}
+    return {"sample": row, "plain": plain, "gated": gated,
+            "tokenizer": tokenizer, "gate_prompt": gate_prompt}
 
 
 def release_niah_rows(repo_root: str | Path, output_dir: str | Path,
