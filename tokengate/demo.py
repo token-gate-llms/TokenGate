@@ -18,6 +18,7 @@ from pathlib import Path
 
 DEMO_CITIES = ("Amman", "Hanoi", "Regina")
 DEMO_DEPTHS = (0.1, 0.5, 0.9)
+DEMO_CACHE_VERSION = 1
 
 
 def niah_examples(repo_root: str | Path, doc_tokens: int = 16384,
