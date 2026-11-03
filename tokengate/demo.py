@@ -145,7 +145,7 @@ def plain_generate(model, tokenizer, prompt_ids: list[int], *,
 
 def plain_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
                   *, chunk_tokens: int | None = None) -> list[dict]:
-    """Warm each shape, then score three ordinary-model calls."""
+    """Warm each shape, then score the selected ordinary-model prompts."""
     import torch
     from tokengate.datasets.tasks import get_task
 
@@ -201,13 +201,16 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     gate_ms = [1000 * mean(r["prefill_s"] for r in gated if r["budget"] == k)
                for k in budgets]
     names = [f"K={k}" for k in budgets]
+    scope = ("One NIAH document" if len(plain) == 1
+             else f"Mean over {len(plain)} NIAH documents")
+    prompt_label = "prompt" if len(plain) == 1 else "prompts"
 
     time_fig, time_ax = plt.subplots(figsize=(7, 3.3))
     time_bars = time_ax.bar(["Baseline", *names], [base_ms, *gate_ms],
                             color=["#64748b", *["#296d5c"] * len(names)])
     time_ax.bar_label(time_bars, fmt="%.0f ms", padding=3)
     time_ax.set(ylabel="Prefill to first token (ms)",
-                title=f"Mean over three NIAH documents · {baseline_name}")
+                title=f"{scope} · {baseline_name}")
     time_ax.set_ylim(0, max(base_ms, *gate_ms) * 1.2)
     time_fig.tight_layout()
 
@@ -217,7 +220,7 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     speed_ax.axhline(1, color="#64748b", linestyle="--", linewidth=1)
     speed_ax.bar_label(speed_bars, labels=[f"{value:.1f}×" for value in speedups], padding=3)
     speed_ax.set(ylabel="Speedup vs ordinary model",
-                 title=f"Same prompts and GPU · {baseline_name}")
+                 title=f"Same {prompt_label} and GPU · {baseline_name}")
     speed_ax.set_ylim(0, max(1, *speedups) * 1.2)
     speed_fig.tight_layout()
 
