@@ -309,7 +309,7 @@ def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
 def run_niah_exploration(repo_root: str | Path, *, base_model: str,
                          checkpoint_id: str, checkpoint_revision: str,
                          gpu_runtime: str, doc_tokens: int, example_index: int,
-                         budgets: tuple[int, ...]) -> dict:
+                         budgets: tuple[int, ...], view_budget: int | None = None) -> dict:
     """Run one selectable example end to end for the notebook's exploration cell."""
     import gc
 
@@ -322,6 +322,10 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
 
     if not budgets or any(k < 1 for k in budgets):
         raise ValueError("Provide at least one positive token budget")
+    selected_budget = (sorted(budgets)[len(budgets) // 2]
+                       if view_budget is None else view_budget)
+    if selected_budget not in budgets:
+        raise ValueError("The selected-token view budget must be one of the tested budgets")
     if gpu_runtime == "T4" and "Qwen3.5" in base_model and doc_tokens > 8192:
         raise ValueError("Qwen3.5 on T4 supports up to 8k document tokens")
     if gpu_runtime == "A100" and torch.cuda.get_device_properties(0).total_memory < 35 * 2**30:
@@ -367,9 +371,8 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
         for fig in result_figures(plain, gated, baseline_name=baseline_name):
             display(fig)
         display(memory_figure(plain, gated, baseline_name=baseline_name))
-        middle_budget = sorted(budgets)[len(budgets) // 2]
-        print(f"Selected document tokens at K={middle_budget}:")
-        show_kept_tokens(gate, tokenizer, gate_prompt, row, budget=middle_budget)
+        print(f"Selected document tokens at K={selected_budget}:")
+        show_kept_tokens(gate, tokenizer, gate_prompt, row, budget=selected_budget)
     finally:
         del gate
         gc.collect()
