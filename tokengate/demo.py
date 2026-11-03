@@ -156,7 +156,7 @@ def plain_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
         torch.cuda.reset_peak_memory_stats()
         answer, seconds = plain_generate(model, tokenizer, prompt, chunk_tokens=chunk_tokens)
         results.append(dict(city=row["city"], depth=row["depth_actual"],
-                            budget="full", answer=answer,
+                            budget="full", answer=answer, prompt_tokens=len(prompt),
                             correct=task.evaluate(answer, row["answer"]),
                             prefill_s=seconds,
                             peak_gib=torch.cuda.max_memory_allocated() / 2**30))
@@ -183,11 +183,42 @@ def gate_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
             results.append(dict(city=row["city"], depth=row["depth_actual"],
                                 budget=k,
                                 answer=out.answers[0],
+                                prompt_tokens=out.n_kept[0],
                                 correct=task.evaluate(out.answers[0], row["answer"]),
                                 prefill_s=out.prefill_s,
                                 peak_gib=torch.cuda.max_memory_allocated() / 2**30,
+                                kept_state=kept_state,
                                 retained=kept_state / (state_end - state_start)))
     return results
+
+
+def show_inference_results(plain: list[dict], gated: list[dict]) -> None:
+    """Show answers and measured metadata in one compact notebook table."""
+    from IPython.display import HTML, display
+
+    def cells(values):
+        return "<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in values) + "</tr>"
+
+    rows = []
+    for result in plain:
+        rows.append(("Ordinary", "Full", result["answer"],
+                     "Yes" if result["correct"] else "No",
+                     f"{result['prefill_s'] * 1000:.0f}",
+                     f"{result['peak_gib']:.2f}", "All",
+                     f"{result['prompt_tokens']:,}" if "prompt_tokens" in result else "—"))
+    for result in gated:
+        kept = (f"{result['kept_state']:,} ({result['retained']:.1%})"
+                if "kept_state" in result else f"{result['retained']:.1%}")
+        rows.append(("TokenGate", f"{result['budget']:,}", result["answer"],
+                     "Yes" if result["correct"] else "No",
+                     f"{result['prefill_s'] * 1000:.0f}",
+                     f"{result['peak_gib']:.2f}", kept,
+                     f"{result['prompt_tokens']:,}" if "prompt_tokens" in result else "—"))
+    headers = ("Method", "Token budget", "Answer", "Correct?", "TTFT (ms)",
+               "Peak GPU (GiB)", "Document kept", "Total prompt kept")
+    heading = "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in headers) + "</tr>"
+    display(HTML('<div style="overflow-x:auto"><table>' + heading
+                 + "".join(cells(row) for row in rows) + "</table></div>"))
 
 
 def result_figures(plain: list[dict], gated: list[dict], *,
@@ -285,6 +316,7 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
     import torch
     from huggingface_hub import snapshot_download
     from IPython.display import display
+    from IPython.utils.io import capture_output
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from tokengate import load_model, split_state_span
 
@@ -309,8 +341,9 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
     print(f"Needle depth: {row['depth_actual']:.0%}; document: {state_end - state_start:,} tokens")
     print(f"Ordinary-model prefill: {baseline_name}")
 
-    plain_model = AutoModelForCausalLM.from_pretrained(
-        base_model, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+    with capture_output():
+        plain_model = AutoModelForCausalLM.from_pretrained(
+            base_model, dtype=dtype, attn_implementation="sdpa").cuda().eval()
     try:
         plain = plain_results(plain_model, tokenizer, [plain_prompt], [row],
                               chunk_tokens=chunk_tokens)
@@ -318,21 +351,13 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
         del plain_model
         gc.collect()
         torch.cuda.empty_cache()
-    for result in plain:
-        print(f"Ordinary: correct={bool(result['correct'])}, "
-              f"TTFT={result['prefill_s'] * 1000:.0f} ms, "
-              f"peak={result['peak_gib']:.2f} GiB, answer={result['answer']!r}")
-
-    checkpoint = snapshot_download(checkpoint_id, revision=checkpoint_revision)
-    gate = load_model(checkpoint, gate_attn="sdpa" if gpu_runtime == "T4" else "flex",
-                      dtype=dtype)
+    with capture_output():
+        checkpoint = snapshot_download(checkpoint_id, revision=checkpoint_revision)
+        gate = load_model(checkpoint, gate_attn="sdpa" if gpu_runtime == "T4" else "flex",
+                          dtype=dtype)
     try:
         gated = gate_results(gate, tokenizer, [gate_prompt], [row], budgets)
-        for result in gated:
-            print(f"K={result['budget']}: correct={bool(result['correct'])}, "
-                  f"TTFT={result['prefill_s'] * 1000:.0f} ms, "
-                  f"peak={result['peak_gib']:.2f} GiB, "
-                  f"retained={result['retained']:.1%}, answer={result['answer']!r}")
+        show_inference_results(plain, gated)
         passing = [k for k in budgets
                    if all(result["correct"] for result in gated if result["budget"] == k)]
         if passing:
