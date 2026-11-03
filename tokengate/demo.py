@@ -231,6 +231,28 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     return time_fig, speed_fig
 
 
+def memory_figure(plain: list[dict], gated: list[dict], *,
+                  baseline_name: str = "Ordinary model"):
+    """Plot peak PyTorch GPU allocation, including model weights, per call."""
+    import matplotlib.pyplot as plt
+    from statistics import mean
+
+    budgets = list(dict.fromkeys(row["budget"] for row in gated))
+    names = ["Baseline", *(f"K={k}" for k in budgets)]
+    peaks = [mean(row["peak_gib"] for row in plain)]
+    peaks += [mean(row["peak_gib"] for row in gated if row["budget"] == k)
+              for k in budgets]
+    fig, ax = plt.subplots(figsize=(7, 3.3))
+    bars = ax.bar(names, peaks, color=["#64748b", *["#296d5c"] * len(budgets)])
+    ax.bar_label(bars, fmt="%.2f GiB", padding=3)
+    ax.set(ylabel="Peak PyTorch GPU allocation (GiB)",
+           title=f"Measured call · {baseline_name}")
+    ax.set_ylim(0, max(peaks) * 1.2)
+    fig.tight_layout()
+    plt.close(fig)
+    return fig
+
+
 def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
                      budget: int = 100):
     """Highlight retained document spans in a scrollable notebook display."""
@@ -251,6 +273,83 @@ def show_kept_tokens(model, tokenizer, prompt: list[int], row: dict,
     print("Answer:", out.answers[0])
     display(HTML('<div style="max-height:320px;overflow:auto;white-space:pre-wrap;line-height:1.55">'
                  + "".join(spans) + "</div>"))
+
+
+def run_niah_exploration(repo_root: str | Path, *, base_model: str,
+                         checkpoint_id: str, checkpoint_revision: str,
+                         gpu_runtime: str, doc_tokens: int, example_index: int,
+                         budgets: tuple[int, ...]) -> dict:
+    """Run one selectable example end to end for the notebook's exploration cell."""
+    import gc
+
+    import torch
+    from huggingface_hub import snapshot_download
+    from IPython.display import display
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from tokengate import load_model, split_state_span
+
+    if not budgets or any(k < 1 for k in budgets):
+        raise ValueError("Provide at least one positive token budget")
+    if gpu_runtime == "T4" and "Qwen3.5" in base_model and doc_tokens > 8192:
+        raise ValueError("Qwen3.5 on T4 supports up to 8k document tokens")
+    if gpu_runtime == "A100" and torch.cuda.get_device_properties(0).total_memory < 35 * 2**30:
+        raise ValueError("Use an A100-class GPU for single-pass prefill")
+
+    row = niah_examples(repo_root, doc_tokens)[example_index]
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+    gate_prompt, plain_prompt = niah_prompt(tokenizer, row)
+    _, state_start, state_end = split_state_span(gate_prompt)
+    chunk_tokens = (1024 if gpu_runtime == "T4" and "Qwen3-1.7B" in base_model
+                    and doc_tokens > 4096 else None)
+    baseline_name = ("chunked base (T4)" if chunk_tokens
+                     else f"single-pass base ({gpu_runtime})")
+    dtype = torch.float16 if gpu_runtime == "T4" else torch.bfloat16
+    print(f"Question: {row['question']}")
+    print(f"Expected answer: {row['answer']}")
+    print(f"Needle depth: {row['depth_actual']:.0%}; document: {state_end - state_start:,} tokens")
+    print(f"Ordinary-model prefill: {baseline_name}")
+
+    plain_model = AutoModelForCausalLM.from_pretrained(
+        base_model, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+    try:
+        plain = plain_results(plain_model, tokenizer, [plain_prompt], [row],
+                              chunk_tokens=chunk_tokens)
+    finally:
+        del plain_model
+        gc.collect()
+        torch.cuda.empty_cache()
+    for result in plain:
+        print(f"Ordinary: correct={bool(result['correct'])}, "
+              f"TTFT={result['prefill_s'] * 1000:.0f} ms, "
+              f"peak={result['peak_gib']:.2f} GiB, answer={result['answer']!r}")
+
+    checkpoint = snapshot_download(checkpoint_id, revision=checkpoint_revision)
+    gate = load_model(checkpoint, gate_attn="sdpa" if gpu_runtime == "T4" else "flex",
+                      dtype=dtype)
+    try:
+        gated = gate_results(gate, tokenizer, [gate_prompt], [row], budgets)
+        for result in gated:
+            print(f"K={result['budget']}: correct={bool(result['correct'])}, "
+                  f"TTFT={result['prefill_s'] * 1000:.0f} ms, "
+                  f"peak={result['peak_gib']:.2f} GiB, "
+                  f"retained={result['retained']:.1%}, answer={result['answer']!r}")
+        passing = [k for k in budgets
+                   if all(result["correct"] for result in gated if result["budget"] == k)]
+        if passing:
+            print(f"Smallest tested budget that retrieved this fact: K={min(passing)}")
+        else:
+            print("No tested budget retrieved this fact; inspect the answers or try a larger K.")
+        for fig in result_figures(plain, gated, baseline_name=baseline_name):
+            display(fig)
+        display(memory_figure(plain, gated, baseline_name=baseline_name))
+        middle_budget = sorted(budgets)[len(budgets) // 2]
+        print(f"Selected document tokens at K={middle_budget}:")
+        show_kept_tokens(gate, tokenizer, gate_prompt, row, budget=middle_budget)
+    finally:
+        del gate
+        gc.collect()
+        torch.cuda.empty_cache()
+    return {"sample": row, "plain": plain, "gated": gated}
 
 
 def release_niah_rows(repo_root: str | Path, output_dir: str | Path,
