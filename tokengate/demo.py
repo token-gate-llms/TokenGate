@@ -7,7 +7,9 @@ the walkthrough. It is not part of the training or inference implementation.
 
 from __future__ import annotations
 
+import base64
 import html
+import io
 import json
 import subprocess
 import sys
@@ -18,7 +20,31 @@ from pathlib import Path
 
 DEMO_CITIES = ("Amman", "Hanoi", "Regina")
 DEMO_DEPTHS = (0.1, 0.5, 0.9)
-DEMO_CACHE_VERSION = 1
+DEMO_CACHE_VERSION = 2
+
+
+def load_sft_baseline(base_model: str, checkpoint_id: str,
+                      checkpoint_file: str, *, revision: str, dtype):
+    """Load and fold the released full-prefill LoRA baseline for this demo."""
+    import torch
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoModelForCausalLM
+    from tokengate.e2e_gate.gate_module.lora import (
+        apply_lora_to_layers, load_lora_state_dict,
+        merge_adapters_into_layers, resolve_all_adapter_layers,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+    layers = resolve_all_adapter_layers(model)
+    apply_lora_to_layers(model, layers, rank=16, alpha=32,
+                         targets=["q_proj", "v_proj"])
+    adapter = torch.load(hf_hub_download(checkpoint_id, checkpoint_file,
+                                         revision=revision),
+                         map_location="cpu", weights_only=True)
+    load_lora_state_dict(model, adapter)
+    merge_adapters_into_layers(model, layers)
+    return model
 
 
 def niah_examples(repo_root: str | Path, doc_tokens: int = 16384,
@@ -194,8 +220,9 @@ def gate_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
     return results
 
 
-def show_inference_results(plain: list[dict], gated: list[dict]) -> None:
-    """Show answers and measured metadata in one compact notebook table."""
+def show_inference_results(plain: list[dict], gated: list[dict], *,
+                           baseline_name: str = "Fine-tuned baseline") -> None:
+    """Show the prefill chart and answer table in one notebook result panel."""
     from IPython.display import HTML, display
 
     def cells(values):
@@ -203,7 +230,7 @@ def show_inference_results(plain: list[dict], gated: list[dict]) -> None:
 
     rows = []
     for result in plain:
-        rows.append(("Ordinary", "Full", result["answer"],
+        rows.append(("FT baseline", "Full", result["answer"],
                      "Yes" if result["correct"] else "No",
                      f"{result['prefill_s'] * 1000:.0f}",
                      f"{result['peak_gib']:.2f}", "All",
@@ -219,13 +246,29 @@ def show_inference_results(plain: list[dict], gated: list[dict]) -> None:
     headers = ("Method", "Token budget", "Answer", "Correct?", "TTFT (ms)",
                "Peak GPU (GiB)", "Document kept", "Total prompt kept")
     heading = "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in headers) + "</tr>"
-    display(HTML('<div style="overflow-x:auto"><table>' + heading
-                 + "".join(cells(row) for row in rows) + "</table></div>"))
+    figure = result_figures(plain, gated, baseline_name=baseline_name)[0]
+    png = io.BytesIO()
+    figure.savefig(png, format="png", dpi=130, bbox_inches="tight")
+    image = base64.b64encode(png.getvalue()).decode("ascii")
+    style = ("<style>.tg-results{border:1px solid #d6dce2;border-radius:12px;"
+             "padding:18px;max-width:1100px}.tg-results img{max-width:100%;"
+             "height:auto;display:block;margin:auto}.tg-results table{border-collapse:collapse;"
+             "width:100%;font-size:13px}.tg-results th,.tg-results td{border-bottom:"
+             "1px solid #e5e7eb;padding:7px;text-align:left;vertical-align:top}"
+             ".tg-results th{font-weight:600}.tg-results tr:nth-child(2) td:first-child"
+             "{color:#64748b;font-weight:600}.tg-results tr:not(:nth-child(2))"
+             " td:first-child{color:#296d5c;font-weight:600}</style>")
+    note = "Only budgets that answered correctly appear in the chart; all answers appear below."
+    display(HTML(style + '<div class="tg-results"><img alt="Measured prefill time with '
+                 'speedup labels" src="data:image/png;base64,' + image + '">'
+                 '<div style="overflow-x:auto"><table>' + heading
+                 + "".join(cells(row) for row in rows) + "</table></div>"
+                 + f'<p style="color:#64748b;font-size:12px">{note}</p></div>'))
 
 
 def result_figures(plain: list[dict], gated: list[dict], *,
-                   baseline_name: str = "Ordinary model"):
-    """Plot timings only for budgets that answer every sampled question correctly."""
+                   baseline_name: str = "Fine-tuned baseline"):
+    """Plot prefill time and label each correct budget's speedup."""
     import matplotlib.pyplot as plt
     from statistics import mean
 
@@ -237,35 +280,25 @@ def result_figures(plain: list[dict], gated: list[dict], *,
     names = [f"K={k}" for k in budgets]
     scope = ("One NIAH document" if len(plain) == 1
              else f"Mean over {len(plain)} NIAH documents")
-    prompt_label = "prompt" if len(plain) == 1 else "prompts"
-
     time_fig, time_ax = plt.subplots(figsize=(7, 3.3))
     time_bars = time_ax.bar(["Baseline", *names], [base_ms, *gate_ms],
                             color=["#64748b", *["#296d5c"] * len(names)])
-    time_ax.bar_label(time_bars, fmt="%.0f ms", padding=3)
+    time_ax.bar_label(time_bars,
+                      labels=[f"{base_ms:.0f} ms",
+                              *[f"{ms:.0f} ms · {base_ms / ms:.1f}×"
+                                for ms in gate_ms]], padding=3)
     time_ax.set(ylabel="Prefill to first token (ms)",
                 title=f"{scope} · {baseline_name}")
-    time_ax.set_ylim(0, max([base_ms, *gate_ms]) * 1.2)
+    time_ax.set_ylim(0, max([base_ms, *gate_ms]) * 1.25)
+    if not gate_ms:
+        time_ax.text(0.5, 0.8, "No correct TokenGate budgets",
+                     transform=time_ax.transAxes, ha="center")
     time_fig.tight_layout()
-
-    speedups = [base_ms / ms for ms in gate_ms]
-    speed_fig, speed_ax = plt.subplots(figsize=(7, 3.3))
-    speed_bars = speed_ax.bar(names, speedups, color="#296d5c")
-    speed_ax.axhline(1, color="#64748b", linestyle="--", linewidth=1)
-    speed_ax.bar_label(speed_bars, labels=[f"{value:.1f}×" for value in speedups], padding=3)
-    speed_ax.set(ylabel="Speedup vs ordinary model",
-                 title=f"Same {prompt_label} and GPU · {baseline_name}")
-    speed_ax.set_ylim(0, max([1, *speedups]) * 1.2)
-    if not speedups:
-        speed_ax.text(0.5, 0.5, "No correct TokenGate budgets",
-                      transform=speed_ax.transAxes, ha="center", va="center")
-    speed_fig.tight_layout()
 
     # Colab auto-renders open Matplotlib figures after the cell. The notebook
     # displays these explicitly, so close them here to prevent duplicates.
     plt.close(time_fig)
-    plt.close(speed_fig)
-    return time_fig, speed_fig
+    return (time_fig,)
 
 
 def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
@@ -288,6 +321,7 @@ def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
 
 def run_niah_exploration(repo_root: str | Path, *, base_model: str,
                          checkpoint_id: str, checkpoint_revision: str,
+                         baseline_checkpoint: tuple[str, str, str],
                          gpu_runtime: str, doc_tokens: int, example_index: int,
                          budgets: tuple[int, ...]) -> dict:
     """Run one selectable example end to end for the notebook's exploration cell."""
@@ -295,9 +329,8 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
 
     import torch
     from huggingface_hub import snapshot_download
-    from IPython.display import display
     from IPython.utils.io import capture_output
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
     from tokengate import load_model, split_state_span
 
     if not budgets or any(k < 1 for k in budgets):
@@ -313,8 +346,8 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
     _, state_start, state_end = split_state_span(gate_prompt)
     chunk_tokens = (1024 if gpu_runtime == "T4" and "Qwen3-1.7B" in base_model
                     and doc_tokens > 4096 else None)
-    baseline_name = ("chunked base (T4)" if chunk_tokens
-                     else f"single-pass base ({gpu_runtime})")
+    baseline_name = ("chunked FT baseline (T4)" if chunk_tokens
+                     else f"single-pass FT baseline ({gpu_runtime})")
     dtype = torch.float16 if gpu_runtime == "T4" else torch.bfloat16
     print(f"Question: {row['question']}")
     print(f"Expected answer: {row['answer']}")
@@ -322,8 +355,9 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
     print(f"Ordinary-model prefill: {baseline_name}")
 
     with capture_output():
-        plain_model = AutoModelForCausalLM.from_pretrained(
-            base_model, dtype=dtype, attn_implementation="sdpa").cuda().eval()
+        plain_model = load_sft_baseline(
+            base_model, baseline_checkpoint[0], baseline_checkpoint[2],
+            revision=baseline_checkpoint[1], dtype=dtype)
     try:
         plain = plain_results(plain_model, tokenizer, [plain_prompt], [row],
                               chunk_tokens=chunk_tokens)
@@ -337,20 +371,19 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
                           dtype=dtype)
     try:
         gated = gate_results(gate, tokenizer, [gate_prompt], [row], budgets)
-        show_inference_results(plain, gated)
+        show_inference_results(plain, gated, baseline_name=baseline_name)
         passing = [k for k in budgets
                    if all(result["correct"] for result in gated if result["budget"] == k)]
         if passing:
             print(f"Smallest tested budget that retrieved this fact: K={min(passing)}")
         else:
             print("No tested budget retrieved this fact; inspect the answers or try a larger K.")
-        for fig in result_figures(plain, gated, baseline_name=baseline_name):
-            display(fig)
     finally:
         del gate
         gc.collect()
         torch.cuda.empty_cache()
-    return {"sample": row, "plain": plain, "gated": gated,
+    return {"cache_version": DEMO_CACHE_VERSION,
+            "sample": row, "plain": plain, "gated": gated,
             "tokenizer": tokenizer, "gate_prompt": gate_prompt}
 
 
@@ -419,3 +452,24 @@ def release_niah_config_kwargs(repo_root: str | Path, base_model: str,
         data_root=str(data_root), packed=True, grad_checkpoint=False,
         wandb_project=None,
     )
+
+
+def train_demo_sft_baseline(base_model: str, data_root: str | Path,
+                            eval_split: str | Path, output_dir: str | Path,
+                            num_gpus: int) -> Path:
+    """Run the notebook's separate full-prefill LoRA control on the same rows."""
+    output_dir = Path(output_dir)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "peft>=0.15"],
+                   check=True)
+    if (output_dir / "adapter_model.safetensors").exists():
+        return output_dir
+    steps = 10200 if base_model == "Qwen/Qwen3-1.7B" else 600
+    subprocess.run([
+        sys.executable, "-m", "torch.distributed.run",
+        f"--nproc_per_node={num_gpus}", "--master_port=29501",
+        "-m", "tokengate.demo_baseline", "--base-model", base_model,
+        "--data-root", str(data_root), "--eval-split", str(eval_split),
+        "--output-dir", str(output_dir), "--max-steps", str(steps),
+        "--grad-accum", str(4 // num_gpus),
+    ], check=True)
+    return output_dir
