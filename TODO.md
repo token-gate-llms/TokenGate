@@ -11,5 +11,5 @@ TODOs:
   sources under the package (or make the import optional with the flex fallback) first.
 - [ ] **Colab quickstart notebook** — the inference quickstart on a free-tier GPU; no
   custom kernel build needed since inference falls back to FlexAttention automatically.
-- [ ] **Full open-source roadmap**
+- [ ] **Full open-source roadmap** — see [ROADMAP.md](ROADMAP.md)
 - [ ] **pixi environment**
