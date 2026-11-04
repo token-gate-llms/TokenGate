@@ -59,7 +59,7 @@ at least one trained gate on the Hub, and eval numbers in the README table.
   unsupported base model, built on the adapter registry. This is where
   community-trained gates come from.
 
-## Tier 3 — Demonstrations
+## Tier 3 — Research Development
 
 Showcases that make the case for token gating beyond the paper's benchmarks.
 Each one is a self-contained example plus a measured curve, not a product
