@@ -59,9 +59,29 @@ at least one trained gate on the Hub, and eval numbers in the README table.
   unsupported base model, built on the adapter registry. This is where
   community-trained gates come from.
 
-## Tier 3 — Platform integrations
+## Tier 3 — Demonstrations
 
-These ride on the backend protocol and the gate artifact spec.
+Showcases that make the case for token gating beyond the paper's benchmarks.
+Each one is a self-contained example plus a measured curve, not a product
+integration.
+
+- [ ] **Token-gated decision models** — single-pass "System One" decision
+  models in the style of [Jev](https://datanorth.ai/blog/jev-what-it-is-and-why-this-new-model-matters)
+  answer typed questions over a context in one forward pass, with no
+  autoregressive generation — so encoding the context is essentially all of
+  the latency. Demo: a typed decision head over a token-gated backbone,
+  showing decision latency that tracks the keep-budget *K* instead of the
+  document length.
+- [ ] **Sub-linear attention scaling** — in a hybrid model with
+  linear-attention layers (already supported: Qwen3.5's DeltaNet layers), the
+  linear layers scan the context in O(n) while TokenGate caps what the
+  full-attention layers keep at *K* tokens. Demo: TTFT and peak-KV-memory
+  curves vs. context length on a hybrid model, measuring how far below linear
+  the attention cost lands as contexts grow.
+
+## Tier 4 — Platform integrations
+
+These ride on the backend protocol and the gate artifact spec (Tier 1).
 
 - [ ] **Hugging Face kernels hub** — publish the `fa2bias` kernel through the
   [`kernels`](https://github.com/huggingface/kernels) library so `pip install`
@@ -82,7 +102,7 @@ These ride on the backend protocol and the gate artifact spec.
 - [ ] **llama.cpp / Ollama** *(help wanted)* — a GGUF gate export and a C++
   port of token-gated attention. Large audience, large effort.
 
-## Tier 4 — Community scaffolding
+## Tier 5 — Community scaffolding
 
 - [ ] **Docs site** — move long-form docs (training guide, adapter-authoring
   guide, gate format spec) out of the README.
