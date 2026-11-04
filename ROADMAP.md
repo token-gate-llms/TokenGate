@@ -61,9 +61,9 @@ at least one trained gate on the Hub, and eval numbers in the README table.
 
 ## Tier 3 — Research Development
 
-Showcases that make the case for token gating beyond the paper's benchmarks.
-Each one is a self-contained example plus a measured curve, not a product
-integration.
+Token gating as an enabler of new frontiers: capabilities that aren't
+practical without pruning the context, not re-runs of the paper's benchmarks.
+Each item ships as a self-contained example plus a measured curve.
 
 - [ ] **Token-gated decision models** — single-pass "System One" decision
   models in the style of [Jev](https://datanorth.ai/blog/jev-what-it-is-and-why-this-new-model-matters)
@@ -81,7 +81,11 @@ integration.
 
 ## Tier 4 — Platform integrations
 
-These ride on the backend protocol and the gate artifact spec (Tier 1).
+These ride on the backend protocol and the gate artifact spec (Tier 1), and
+cover both halves of the lifecycle: serving a trained gate, and training one
+inside the fine-tuning stacks people already use.
+
+### Inference and serving
 
 - [ ] **Hugging Face kernels hub** — publish the `fa2bias` kernel through the
   [`kernels`](https://github.com/huggingface/kernels) library so `pip install`
@@ -101,6 +105,19 @@ These ride on the backend protocol and the gate artifact spec (Tier 1).
   headline use case; cheap and worth doing early.
 - [ ] **llama.cpp / Ollama** *(help wanted)* — a GGUF gate export and a C++
   port of token-gated attention. Large audience, large effort.
+
+### Training
+
+- [ ] **PEFT / TRL** — the trainer already exposes a TRL-style interface
+  (`tokengate/trainer.py`); formalize it, and export the gate's LoRA as a
+  standard PEFT adapter (part of the gate artifact spec), so a gate trains and
+  loads inside the Hugging Face training stack rather than alongside it.
+- [ ] **Axolotl / LLaMA-Factory recipes** — gate-training recipes for the
+  popular fine-tuning frameworks, so training a gate on your own data is a
+  config file, not our driver scripts.
+- [ ] **Distributed training backends** — document and test the trainer under
+  the standard multi-GPU launchers (torchrun today; accelerate/FSDP configs),
+  so gate training on larger backbones composes with existing cluster setups.
 
 ## Tier 5 — Community scaffolding
 
