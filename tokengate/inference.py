@@ -132,6 +132,7 @@ def load_model(
     base_model: Optional[str] = None,
     gate_layer: Optional[int] = None,
     gate_attn: str = "fa2",
+    dtype=None,
 ) -> TokenGateModel:
     """Load a trained TokenGate checkpoint as ONE model object.
 
@@ -142,9 +143,15 @@ def load_model(
         overrides the recorded values.
     gate_attn : inference kernels — "fa2" (default; FlashAttention-2 + the
         key-bias kernel, matches the training runs) or "flex" (no custom
-        kernel build needed, slower).
+        kernel build needed, slower), or "sdpa" (chunked compatibility path).
+    dtype : backbone inference dtype; defaults to torch.bfloat16. Use
+        torch.float16 with gate_attn="sdpa" for the experimental T4 path.
     """
     import torch
+    if dtype is None:
+        dtype = torch.bfloat16
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("dtype must be torch.float16, torch.bfloat16, or torch.float32")
     gate_path = _resolve_gate_path(checkpoint)
     meta = torch.load(gate_path, map_location="cpu",
                       weights_only=False).get("metadata", {})
@@ -162,5 +169,5 @@ def load_model(
                 "gate_layer= explicitly")
     from tokengate.e2e_gate.bench.benchmark_gate_e2e import load_gate_model
     model, gate, _ = load_gate_model(base_model, gate_path, gate_layer,
-                                     gate_attn=gate_attn)
+                                     gate_attn=gate_attn, dtype=dtype)
     return TokenGateModel(model, gate, gate_layer, base_model)
