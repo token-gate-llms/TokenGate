@@ -23,6 +23,31 @@ DEMO_DEPTHS = (0.1, 0.5, 0.9)
 DEMO_CACHE_VERSION = 2
 
 
+def prepare_runtime(source: str | Path, gpu_runtime: str, model_name: str) -> None:
+    """Install notebook dependencies and check its selected GPU."""
+    import logging
+    import os
+    import warnings
+
+    import torch
+
+    assert torch.cuda.is_available(), "Choose a GPU runtime first."
+    assert gpu_runtime in torch.cuda.get_device_name(0), (
+        f"Select a {gpu_runtime} GPU in Colab: Runtime → Change runtime type.")
+    os.environ["HF_HUB_VERBOSITY"] = "error"
+    os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", message="You are sending unauthenticated requests to the HF Hub.*")
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-e",
+                    str(source), "transformers==5.5.0", "matplotlib",
+                    "ipywidgets>=8"], check=True)
+    if model_name == "Qwen3.5-2B":
+        from transformers.models.qwen3_5.modeling_qwen3_5 import is_fast_path_available
+        if not is_fast_path_available:
+            logging.getLogger("transformers.models.qwen3_5.modeling_qwen3_5").setLevel(logging.ERROR)
+            print("Qwen3.5: PyTorch DeltaNet fallback is active; timings include it.")
+
+
 def load_sft_baseline(base_model: str, checkpoint_id: str,
                       checkpoint_file: str, *, revision: str, dtype):
     """Load and fold the released full-prefill LoRA baseline for this demo."""
