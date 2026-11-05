@@ -121,6 +121,14 @@ def niah_prompt_text(row: dict) -> str:
     return task.format_prompt("{state}\n\nQuestion: " + row["question"])
 
 
+def niah_needle(row: dict) -> str:
+    """Return the exact sentence planted in this NIAH document."""
+    needle = f"The best thing to do in {row['city']} is {row['answer']}."
+    if needle not in row["body"]:
+        raise ValueError("The expected NIAH needle is missing from this document")
+    return needle
+
+
 def niah_prompt(tokenizer, row: dict) -> tuple[list[int], list[int]]:
     """Return (TokenGate sentinel prompt, ordinary full-context prompt)."""
     from tokengate import apply_chat_template, split_state_span
@@ -247,7 +255,7 @@ def gate_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
 
 def show_inference_results(plain: list[dict], gated: list[dict], *,
                            baseline_name: str = "Fine-tuned baseline") -> None:
-    """Show the prefill chart and answer table in one notebook result panel."""
+    """Show the chart, answers, and a measured takeaway in one result panel."""
     from IPython.display import HTML, display
 
     def cells(values):
@@ -269,7 +277,7 @@ def show_inference_results(plain: list[dict], gated: list[dict], *,
                      f"{result['peak_gib']:.2f}", kept,
                      f"{result['prompt_tokens']:,}" if "prompt_tokens" in result else "—"))
     headers = ("Method", "Token budget", "Answer", "Correct?", "TTFT (ms)",
-               "Peak GPU (GiB)", "Document kept", "Total prompt kept")
+               "Peak PyTorch (GiB)", "Document kept", "Total prompt kept")
     heading = "<tr>" + "".join(f"<th>{html.escape(h)}</th>" for h in headers) + "</tr>"
     figure = result_figures(plain, gated, baseline_name=baseline_name)[0]
     png = io.BytesIO()
@@ -282,11 +290,33 @@ def show_inference_results(plain: list[dict], gated: list[dict], *,
              "1px solid #e5e7eb;padding:7px;text-align:left;vertical-align:top}"
              ".tg-results th{font-weight:600}.tg-results tr:nth-child(2) td:first-child"
              "{color:#64748b;font-weight:600}.tg-results tr:not(:nth-child(2))"
-             " td:first-child{color:#296d5c;font-weight:600}</style>")
+             " td:first-child{color:#296d5c;font-weight:600}"
+             ".tg-takeaway{background:#e8f5f0;border-left:4px solid #296d5c;"
+             "padding:10px 12px;margin-top:14px;border-radius:4px;color:#173f33}</style>")
+    takeaway = "Compare a correct answer with TTFT before interpreting a speedup."
+    if len(plain) == 1:
+        passing = [result for result in gated if result["correct"]]
+        if plain[0]["correct"] and passing:
+            chosen = next((r for r in passing if r["budget"] == 100),
+                          min(passing, key=lambda r: r["prefill_s"]))
+            ratio = plain[0]["prefill_s"] / chosen["prefill_s"]
+            pace = (f"{ratio:.1f}× faster" if ratio >= 1
+                    else f"{1 / ratio:.1f}× slower")
+            takeaway = (f"On this question, TokenGate answered correctly at "
+                        f"K={chosen['budget']:,}, kept {chosen['retained']:.1%} "
+                        f"of the document, and reached the first token "
+                        f"{pace} than the fine-tuned baseline.")
+        elif not passing:
+            takeaway = "None of the tested TokenGate budgets found this needle; try a larger budget."
+        else:
+            takeaway = ("TokenGate found this needle, but the fine-tuned baseline "
+                        "missed it. Compare answers before treating their timing ratio as a matched-accuracy speedup.")
     display(HTML(style + '<div class="tg-results"><img alt="Measured prefill time with '
                  'speedup labels" src="data:image/png;base64,' + image + '">'
                  '<div style="overflow-x:auto"><table>' + heading
-                 + "".join(cells(row) for row in rows) + "</table></div></div>"))
+                 + "".join(cells(row) for row in rows) + "</table></div>"
+                 + '<div class="tg-takeaway"><strong>This run:</strong> '
+                 + html.escape(takeaway) + '</div></div>'))
 
 
 def result_figures(plain: list[dict], gated: list[dict], *,
@@ -325,13 +355,10 @@ def result_figures(plain: list[dict], gated: list[dict], *,
 
 
 def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
-    """Show the search target, then highlight kept document tokens."""
+    """Highlight kept document tokens after the notebook names the target."""
     from IPython.display import HTML, display
     from tokengate import split_state_span
 
-    needle = f"The best thing to do in {row['city']} is {row['answer']}."
-    if needle not in row["body"]:
-        raise ValueError("The expected NIAH needle is missing from this document")
     clean, start, end = split_state_span(prompt)
     selected = set(result["kept_pos"])
     spans = []
@@ -339,8 +366,6 @@ def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
         piece = html.escape(tokenizer.decode([clean[p] for p in positions]))
         style = "background:#bbf7d0;color:#14532d" if keep else "color:#777"
         spans.append(f'<span style="{style}">{piece}</span>')
-    print(f"Question: {row['question']}")
-    print(f"Needle: {needle}")
     print(f"Depth {row['depth_actual']:.0%} · K={result['budget']} · "
           f"kept {sum(start <= p < end for p in selected):,}/{end-start:,} document tokens")
     display(HTML('<div style="max-height:320px;overflow:auto;white-space:pre-wrap;line-height:1.55">'
