@@ -300,10 +300,13 @@ def result_figures(plain: list[dict], gated: list[dict], *,
 
 
 def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
-    """Highlight the document positions saved in a measured gate result."""
+    """Show the search target, then highlight kept document tokens."""
     from IPython.display import HTML, display
     from tokengate import split_state_span
 
+    needle = f"The best thing to do in {row['city']} is {row['answer']}."
+    if needle not in row["body"]:
+        raise ValueError("The expected NIAH needle is missing from this document")
     clean, start, end = split_state_span(prompt)
     selected = set(result["kept_pos"])
     spans = []
@@ -311,7 +314,9 @@ def show_kept_tokens(tokenizer, prompt: list[int], row: dict, result: dict):
         piece = html.escape(tokenizer.decode([clean[p] for p in positions]))
         style = "background:#bbf7d0;color:#14532d" if keep else "color:#777"
         spans.append(f'<span style="{style}">{piece}</span>')
-    print(f"{row['city']} · depth {row['depth_actual']:.0%} · K={result['budget']} · "
+    print(f"Question: {row['question']}")
+    print(f"Needle: {needle}")
+    print(f"Depth {row['depth_actual']:.0%} · K={result['budget']} · "
           f"kept {sum(start <= p < end for p in selected):,}/{end-start:,} document tokens")
     display(HTML('<div style="max-height:320px;overflow:auto;white-space:pre-wrap;line-height:1.55">'
                  + "".join(spans) + "</div>"))
