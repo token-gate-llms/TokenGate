@@ -299,13 +299,18 @@ def show_inference_results(plain: list[dict], gated: list[dict], *,
         if plain[0]["correct"] and passing:
             chosen = next((r for r in passing if r["budget"] == 100),
                           min(passing, key=lambda r: r["prefill_s"]))
-            ratio = plain[0]["prefill_s"] / chosen["prefill_s"]
-            pace = (f"{ratio:.1f}× faster" if ratio >= 1
-                    else f"{1 / ratio:.1f}× slower")
-            takeaway = (f"On this question, TokenGate answered correctly at "
-                        f"K={chosen['budget']:,}, kept {chosen['retained']:.1%} "
-                        f"of the document, and reached the first token "
-                        f"{pace} than the fine-tuned baseline.")
+            time_ratio = plain[0]["prefill_s"] / chosen["prefill_s"]
+            memory_ratio = plain[0]["peak_gib"] / chosen["peak_gib"]
+            pace = (f"{time_ratio:.1f}× faster" if time_ratio > 1.05
+                    else f"{1 / time_ratio:.1f}× slower" if time_ratio < 0.95
+                    else "about the same")
+            memory = (f"{memory_ratio:.1f}× lower" if memory_ratio > 1.05
+                      else f"{1 / memory_ratio:.1f}× higher" if memory_ratio < 0.95
+                      else "about the same")
+            takeaway = (f"At K={chosen['budget']:,}, TokenGate still found the needle "
+                        f"while keeping {chosen['retained']:.1%} of the document. "
+                        f"TTFT was {pace} and peak PyTorch memory was {memory} "
+                        f"compared with the fine-tuned baseline.")
         elif not passing:
             takeaway = "None of the tested TokenGate budgets found this needle; try a larger budget."
         else:
