@@ -258,12 +258,10 @@ def show_inference_results(plain: list[dict], gated: list[dict], *,
              ".tg-results th{font-weight:600}.tg-results tr:nth-child(2) td:first-child"
              "{color:#64748b;font-weight:600}.tg-results tr:not(:nth-child(2))"
              " td:first-child{color:#296d5c;font-weight:600}</style>")
-    note = "Only budgets that answered correctly appear in the chart; all answers appear below."
     display(HTML(style + '<div class="tg-results"><img alt="Measured prefill time with '
                  'speedup labels" src="data:image/png;base64,' + image + '">'
                  '<div style="overflow-x:auto"><table>' + heading
-                 + "".join(cells(row) for row in rows) + "</table></div>"
-                 + f'<p style="color:#64748b;font-size:12px">{note}</p></div>'))
+                 + "".join(cells(row) for row in rows) + "</table></div></div>"))
 
 
 def result_figures(plain: list[dict], gated: list[dict], *,
@@ -287,7 +285,7 @@ def result_figures(plain: list[dict], gated: list[dict], *,
                       labels=[f"{base_ms:.0f} ms",
                               *[f"{ms:.0f} ms · {base_ms / ms:.1f}×"
                                 for ms in gate_ms]], padding=3)
-    time_ax.set(ylabel="Prefill to first token (ms)",
+    time_ax.set(ylabel="TTFT (ms)",
                 title=f"{scope} · {baseline_name}")
     time_ax.set_ylim(0, max([base_ms, *gate_ms]) * 1.25)
     if not gate_ms:
@@ -372,12 +370,6 @@ def run_niah_exploration(repo_root: str | Path, *, base_model: str,
     try:
         gated = gate_results(gate, tokenizer, [gate_prompt], [row], budgets)
         show_inference_results(plain, gated, baseline_name=baseline_name)
-        passing = [k for k in budgets
-                   if all(result["correct"] for result in gated if result["budget"] == k)]
-        if passing:
-            print(f"Smallest tested budget that retrieved this fact: K={min(passing)}")
-        else:
-            print("No tested budget retrieved this fact; inspect the answers or try a larger K.")
     finally:
         del gate
         gc.collect()
