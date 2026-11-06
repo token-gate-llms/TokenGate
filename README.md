@@ -272,6 +272,117 @@ Measured training requires a passing smoke from the same source snapshot.
 inspected incomplete measured run. Active GPUs and concurrent drivers are refused.
 Failed attempts remain available for diagnosis.
 
+Serving checks require the [TokenGate vLLM fork](https://github.com/luis-gasparschroeder/vllm/tree/lgs/tokengate); stock vLLM does not support the trained gate.
+
+Export uses the fork’s `tools/export_token_gate.py`. If vLLM was installed from
+a wheel, pass `--vllm-source /path/to/vllm` to the export commands.
+
+After training, use the existing benchmark CLI. Its original `--config` mode
+remains available; `--stage` selects the recorded reproduction workflow:
+
+| Stage | Purpose |
+|---|---|
+| `quality` | Original TokenGate decoder: per-example predictions, raw tokens, accuracy and loss. |
+| `select-budget` | Freeze the smallest budget matching the same-seed SFT validation accuracy. |
+| `export` | Export the selected adapter/gate for serving or a merged research reference. |
+| `qualify` | Compare reference/revised research decoding and token delivery exactly. |
+| `vllm-trace`, `compare` | Compare original research → merged research → vLLM, including retained positions. |
+| `vllm-quality` | Measure the serving checkpoint's accuracy on the same inputs. |
+| `audit` | Independently check research answer files and their qualification/selection evidence. |
+| `benchmark` | Measure prefill or decode latency, serial throughput and memory at a specified budget. |
+
+<details>
+<summary>Evaluation and benchmark commands</summary>
+
+Set `CUDA_VISIBLE_DEVICES` to one idle GPU. Repeat this sequence for each
+backbone/gate/seed pair; SFT uses `--budget full` when timing. Each new attempt
+gets its own output directory.
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+RUN="$NIAH_ROOT/training/Qwen3-1.7B-gate1-seed0"
+SFT="$NIAH_ROOT/training/Qwen3-1.7B-sft-seed0"
+OUT="$NIAH_ROOT/results/Qwen3-1.7B-gate1-seed0"
+mkdir -p "$OUT"
+
+python benchmarks/run_benchmark.py --stage quality --run "$SFT" \
+  --output "$OUT/sft-validation" --tier 16k --partition validation
+python benchmarks/run_benchmark.py --stage quality --run "$RUN" \
+  --output "$OUT/validation" --tier 16k --partition validation
+python benchmarks/run_benchmark.py --stage select-budget \
+  --validation "$OUT/validation" --baseline "$OUT/sft-validation" --output "$OUT/decision.json"
+python benchmarks/run_benchmark.py --stage quality --run "$RUN" \
+  --output "$OUT/test-16k" --tier 16k --partition test --decision "$OUT/decision.json"
+python benchmarks/run_benchmark.py --stage quality --run "$RUN" \
+  --output "$OUT/test-32k" --tier 32k --partition test --decision "$OUT/decision.json"
+
+python benchmarks/run_benchmark.py --stage export --run "$RUN" \
+  --kind serving --output "$OUT/serving"
+python benchmarks/run_benchmark.py --stage export --run "$RUN" \
+  --kind merged-reference --output "$OUT/merged"
+python benchmarks/run_benchmark.py --stage vllm-trace --run "$RUN" \
+  --export "$OUT/serving" --tier 16k --output "$OUT/trace-16k"
+python benchmarks/run_benchmark.py --stage compare --run "$RUN" \
+  --trace "$OUT/trace-16k" --merged-export "$OUT/merged" --output "$OUT/comparison-16k"
+python benchmarks/run_benchmark.py --stage vllm-quality --run "$RUN" \
+  --export "$OUT/serving" --tier 16k --partition test \
+  --decision "$OUT/decision.json" --output "$OUT/vllm-test-16k"
+
+# Qualify the original implementation against the frozen training checkout.
+# FROZEN_CHECKOUT must be the unchanged source recorded by training.
+FROZEN_CHECKOUT=/path/to/frozen/training-checkout
+python benchmarks/run_benchmark.py --stage qualify --run "$RUN" \
+  --training-root "$NIAH_ROOT" --reference-source "$FROZEN_CHECKOUT" \
+  --inference-source "$PWD" --gpu "$CUDA_VISIBLE_DEVICES" --tier 16k \
+  --output "$OUT/decode-qualification-16k"
+
+# Measurements require passing qualification for this source and budget.
+# Choose K from decision.json; repeat for the desired accuracy/budget frontier.
+K=500
+python benchmarks/run_benchmark.py --stage benchmark --engine research --run "$RUN" \
+  --tier 16k --partition test --budget "$K" --phase prefill \
+  --decision "$OUT/decision.json" --quality "$OUT/test-16k" \
+  --qualification "$OUT/decode-qualification-16k" --output "$OUT/research-prefill"
+python benchmarks/run_benchmark.py --stage benchmark --engine vllm --run "$RUN" \
+  --export "$OUT/serving" --tier 16k --partition test --budget "$K" --phase prefill \
+  --decision "$OUT/decision.json" --quality "$OUT/vllm-test-16k" \
+  --qualification "$OUT/comparison-16k" --output "$OUT/vllm-prefill"
+```
+
+Repeat serving qualification and quality at 32K. Use `--phase decode` with a new
+output directory for full generation and serial throughput. This is batch-size-1
+execution, not a concurrent server-load benchmark. Occupied KV cache, backing
+capacity, and allocator peaks are recorded separately. Performance runs require
+completed training, matching quality evidence, and numerical qualification for
+the checkpoint, source, runtime, context tier, budget and execution mode.
+`--diagnostic` runs smoke checkpoints without publishing timing values.
+Qualification covers two fixed validation prompts; it does not establish
+full-test accuracy or equivalence on every possible input.
+
+For a changed research decoder, `--stage qualify --run RUN --training-root ROOT
+--reference-source FROZEN_CHECKOUT --inference-source CURRENT_CHECKOUT --gpu 0
+--tier 16k --output OUTPUT` checks logits, tokens, answers and retained positions
+with zero tolerance. Both checkouts must contain the integrated CLI. Historical
+pre-consolidation revisions use their archived qualification driver. When loading
+an older checkpoint, `--training-source FROZEN_CHECKOUT` verifies its original
+manifest; it never silently rewrites provenance. Run `--stage audit --help` for
+independent answer-file verification.
+
+</details>
+
+Training validation uses 50 fixed 16K prompts; held-out evaluation uses the
+committed 16K/32K test splits. Budget/checkpoint selection must not use test scores.
+Cross-engine qualification requires every log-probability entry to satisfy
+`atol=rtol=0.02`, exact retained positions, and exact shared-scorer outputs.
+A passing small numerical fixture does not establish full held-out quality.
+Keep paper reference values separate from new measurements and aggregate seeds
+only after validating each run's evidence.
+
+Everything required to generate data, train, evaluate, export and measure is in
+the tracked source tree. `/experiments/` holds local outputs, the HTML report and
+historical evidence; `/temp/` holds scratch/reference material. Neither directory
+is imported by the reproduction entry points.
+
 ### Training the TokenGate model
 
 The released checkpoints train from the lane configs under `train-scripts/`

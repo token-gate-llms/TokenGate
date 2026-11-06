@@ -62,3 +62,9 @@ paper-benchmarks/results/**/*.pkl
 paper-benchmarks/results/**/*.log
 datasets/niah_kamradt/niah_kamradt_64k.jsonl
 datasets/niah_kamradt/niah_kamradt_128k.jsonl
+
+# Temporary local files and reference material
+/temp/
+
+# Folder for experimental results that should not be tracked
+/experiments/

@@ -25,11 +25,9 @@ store + split manifest; --split picks the val partition or the full reserved
 test partition).
 """
 import argparse
-import glob
 import json
 import os
 import sys
-import time
 
 import torch
 import yaml
@@ -39,63 +37,59 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 
-def _resolve_checkpoint(spec: str) -> str:
-    """A local dir is used as-is; anything else is a HF Hub repo id."""
-    if os.path.isdir(spec):
-        return spec
-    from huggingface_hub import snapshot_download
-    print(f"[bench] downloading checkpoint from hf.co/{spec} ...")
-    return snapshot_download(spec)
+import fcntl
+from pathlib import Path
 
-
-def _gate_path(ckpt_dir: str) -> str:
-    for pat in ("swa_gate_*.pt", "gate_final.pt", "gate_step*.pt"):
-        hits = sorted(glob.glob(os.path.join(ckpt_dir, pat)))
-        if hits:
-            return hits[-1]
-    raise FileNotFoundError(f"no gate checkpoint (gate_*.pt) in {ckpt_dir}")
+from tokengate.datasets.tasks.niah import NiahKamradtTask
+from tokengate.datasets.dataset import load_rows
+from tokengate.e2e_gate.artifacts import (
+    atomic_json,
+    capture_source,
+    file_hash,
+    runtime_evidence,
+)
+from tokengate.e2e_gate.bench.budget_selection import (
+    evaluation_budgets,
+    read_answers,
+    validate_decision,
+)
+from tokengate.e2e_gate.train.selection import selected_checkpoint
+from tokengate.generators import _strip_thinking
+from tokengate.inference import _resolve_gate_path
+from tokengate.e2e_gate.bench.runtime import (
+    load_checkpoint,
+    prefill_selection,
+    serving_settings,
+    validate_retained_positions,
+)
+from tokengate.e2e_gate.bench.export import verify_export
 
 
 @torch.no_grad()
 def _full_prefill_arm(base_model: str, metas, task, max_new_tokens: int):
     """Standard prefill baseline: unmodified model, every token cached."""
     from transformers import AutoModelForCausalLM
-    from transformers.cache_utils import DynamicCache
+    from tokengate.e2e_gate.decode.gate_decode import generate_batch
 
     model = AutoModelForCausalLM.from_pretrained(
         base_model, dtype=torch.bfloat16, attn_implementation="sdpa",
     ).cuda().eval()
 
-    def _run(meta, timed: bool):
-        ids = torch.tensor([meta["prompt_ids"]], device="cuda")
-        cache = DynamicCache(config=model.config)
-        if timed:
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        out = model(ids, past_key_values=cache, use_cache=True)
-        tok = out.logits[:, -1].argmax(-1, keepdim=True)
-        if timed:
-            torch.cuda.synchronize()
-        ttft = time.perf_counter() - t0
-        generated = [tok]
-        for _ in range(max_new_tokens - 1):
-            if generated[-1].item() == _EOS_ID:
-                break
-            out = model(generated[-1], past_key_values=cache, use_cache=True)
-            generated.append(out.logits[:, -1].argmax(-1, keepdim=True))
-        if generated and generated[-1].item() == _EOS_ID:
-            generated = generated[:-1]
-        text = _TOK.decode(torch.cat(generated, dim=1)[0], skip_special_tokens=True)
-        return _strip_thinking(text), ttft
+    def _run(meta):
+        result = generate_batch(
+            model, None, _TOK, [meta["prompt_ids"]], [meta["article_start"]],
+            [meta["article_end"]], None, None, max_new_tokens,
+        )
+        return result.answers[0], result.prefill_s
 
-    _run(metas[0], timed=False)  # warmup (kernel autotune, allocator)
+    _run(metas[0])  # warmup (kernel autotune, allocator)
     rows = []
     for m in metas:
-        ans, ttft = _run(m, timed=True)
+        ans, ttft = _run(m)
         rows.append({"id": m["sample"]["id"], "ttft_s": ttft,
                      "acc": task.evaluate(ans, m["sample"]["target"]),
                      "answer": ans})
-    del model
+    model = None
     torch.cuda.empty_cache()
     return rows
 
@@ -104,7 +98,9 @@ def _full_prefill_arm(base_model: str, metas, task, max_new_tokens: int):
 def _tokengate_arm(base_model, gate_path, gate_layer, gate_attn, metas, task,
                    k_values, max_new_tokens):
     from tokengate.e2e_gate.bench.benchmark_gate_e2e import (
-        gate_generate_batch, load_gate_model)
+        gate_generate_batch,
+        load_gate_model,
+    )
     model, gate, _ = load_gate_model(
         base_model, gate_path, gate_layer, gate_attn=gate_attn)
 
@@ -151,6 +147,8 @@ def _load_split_samples(cfg, split: str):
 
 
 def main():
+    if "--stage" in sys.argv:
+        return reproduction_main(sys.argv[1:])
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", required=True, help="benchmark YAML config")
     ap.add_argument("--split", default="val", choices=["val", "test"],
@@ -176,14 +174,12 @@ def main():
     k_values = args.k or cfg["k_values"]
 
     from transformers import AutoTokenizer
+
     from tokengate.datasets.tasks import get_task
     from tokengate.e2e_gate.bench.benchmark_gate_e2e import build_metas
-    from tokengate.generators import _strip_thinking as _st
 
-    global _TOK, _EOS_ID, _strip_thinking
+    global _TOK
     _TOK = AutoTokenizer.from_pretrained(cfg["base_model"])
-    _EOS_ID = _TOK.eos_token_id
-    _strip_thinking = _st
 
     task = get_task(cfg["task"])
     if "samples" in cfg:
@@ -207,7 +203,7 @@ def main():
     full_rows = _full_prefill_arm(cfg["base_model"], metas, task,
                                   cfg["max_new_tokens"])
     gate_rows = _tokengate_arm(
-        cfg["base_model"], _gate_path(_resolve_checkpoint(cfg["checkpoint"])),
+        cfg["base_model"], _resolve_gate_path(cfg["checkpoint"]),
         cfg["gate_layer"], cfg["gate_attn"], metas, task, k_values,
         cfg["max_new_tokens"])
 
@@ -227,6 +223,398 @@ def main():
         print(f"{'tokengate':<12} {str(k):>6} {_mean(rows, 'acc'):>10.3f} "
               f"{ttft * 1e3:>10.1f} {full_ttft / ttft:>7.2f}x")
     print()
+
+
+
+
+def run_research_evaluation(args: argparse.Namespace) -> None:
+    from tokengate.e2e_gate.train.train_e2e_gate import evaluate_reproduction
+
+    config, checkpoint = selected_checkpoint(
+        args.run, diagnostic=args.diagnostic, training_source=args.training_source
+    )
+    if args.partition == "validation" and args.tier != "16k":
+        raise ValueError("32K reserved validation cannot select budgets/checkpoints")
+    if args.diagnostic and args.partition != "validation":
+        raise ValueError("Smoke diagnostics cannot evaluate held-out examples")
+    decision_hash = None
+    if args.partition != "validation":
+        if args.decision is None:
+            raise ValueError("Freeze a validation-only deployment decision first")
+        decision_hash = validate_decision(args.decision, checkpoint)
+    rows, data_evidence = load_rows(config, args.tier)
+    if args.partition != "all":
+        rows = [row for row in rows if row["partition"] == args.partition]
+    if args.diagnostic:
+        rows = rows[:4]
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "evaluation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        source = capture_source(Path(__file__).resolve().parents[1], output)
+        budgets = evaluation_budgets() if checkpoint["gate_path"] else (None,)
+        manifest = {
+            "engine": "research",
+            "execution": "eager",
+            "attention_backend": config["attn_backend"],
+            "deterministic_algorithms": True,
+            "checkpoint": checkpoint,
+            "tier": args.tier,
+            "partition": args.partition,
+            "ids": [row["id"] for row in rows],
+            "data": data_evidence,
+            "code_manifest_sha256": file_hash(source),
+            "training_source": str(args.training_source.resolve())
+            if args.training_source
+            else str(Path(__file__).resolve().parents[1]),
+            "training_source_manifest_sha256": config["code_manifest_sha256"],
+            "decision_sha256": decision_hash,
+            "max_gen_tokens": config["max_gen_tokens"],
+            "budgets": budgets,
+        }
+        manifest_path = output / "evaluation.json"
+        # JSON normalizes tuples to lists; compare the serialized representation.
+        manifest = json.loads(json.dumps(manifest))
+        if manifest_path.exists():
+            if json.loads(manifest_path.read_text()) != manifest:
+                raise ValueError(
+                    "Evaluation inputs changed; use a new output directory"
+                )
+        else:
+            atomic_json(manifest, manifest_path)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        model, gate, tokenizer = load_checkpoint(config, checkpoint)
+        summaries = []
+        for budget in budgets:
+            directory = output / ("full" if budget is None else f"K{budget}")
+            completed = directory / "summary.json"
+            if completed.exists():
+                summary = json.loads(completed.read_text())
+                read_answers(directory, summary, manifest["ids"])
+            else:
+                # Incomplete directories are evidence of a failed attempt. Keep
+                # them intact and require a new output path after diagnosis.
+                directory.mkdir()
+                metrics = evaluate_reproduction(
+                    model,
+                    gate,
+                    tokenizer,
+                    rows,
+                    config,
+                    budget=budget,
+                    step=checkpoint["selection"]["step"],
+                    variant=checkpoint["selection"]["variant"],
+                    rank=0,
+                    world_size=1,
+                    output=directory,
+                )
+                paths = list(directory.glob("step*.jsonl"))
+                if len(paths) != 1:
+                    raise RuntimeError("Expected exactly one evaluation answer file")
+                answers = [
+                    json.loads(line) for line in paths[0].read_text().splitlines()
+                ]
+                if [item["id"] for item in answers] != manifest["ids"]:
+                    raise RuntimeError("Evaluation answers do not match requested IDs")
+                with (directory / "answers.jsonl").open("x") as stream:
+                    for row, answer in zip(rows, answers, strict=True):
+                        answer.update(
+                            {
+                                key: row[key]
+                                for key in (
+                                    "partition",
+                                    "city",
+                                    "depth_requested",
+                                    "depth_actual",
+                                    "article_start",
+                                    "article_end",
+                                )
+                            }
+                        )
+                        stream.write(json.dumps(answer, allow_nan=False) + "\n")
+                summary = {
+                    "budget": budget,
+                    **metrics,
+                    "answers_sha256": file_hash(directory / "answers.jsonl"),
+                }
+                atomic_json(summary, completed)
+            summaries.append(summary)
+            print(json.dumps(summary), flush=True)
+        atomic_json({"complete": True, "results": summaries}, output / "status.json")
+
+
+def evaluate_serving_budget(runner, rows: list[dict], *, budget, cap: int):
+    """Yield scored serial responses and the selection used during each prefill."""
+    tokenizer = runner.llm.get_tokenizer()
+    task = NiahKamradtTask()
+    for row in rows:
+        responses = runner.generate(row, budget, cap)
+        completion = next(responses)
+        positions = (
+            runner.llm.collective_rpc(prefill_selection)[0]["retained"].tolist()
+            if runner.gate
+            else list(range(row["ctx_len"]))
+        )
+        validate_retained_positions(positions, row, budget if runner.gate else None)
+        for completion in responses:
+            pass
+        tokens = list(completion.token_ids)
+        prediction = _strip_thinking(tokenizer.decode(tokens, skip_special_tokens=True))
+        yield {
+            **{
+                key: row[key]
+                for key in (
+                    "id",
+                    "target",
+                    "partition",
+                    "city",
+                    "depth_requested",
+                    "depth_actual",
+                    "article_start",
+                    "article_end",
+                )
+            },
+            "prediction": prediction,
+            "accuracy": task.evaluate(prediction, row["target"]),
+            "token_ids": tokens,
+            "finish_reason": completion.finish_reason,
+            "stop_reason": completion.stop_reason,
+            "kept_positions": positions,
+            "prompt_tokens": row["ctx_len"],
+            "budget": budget,
+        }
+
+
+def run_serving_evaluation(args: argparse.Namespace) -> None:
+    from tokengate.e2e_gate.bench.runtime import ServingRunner
+
+    if args.partition == "validation" and args.tier != "16k":
+        raise ValueError("32K reserved validation cannot select budgets/checkpoints")
+    if args.diagnostic and args.partition != "validation":
+        raise ValueError("Smoke diagnostics cannot evaluate held-out examples")
+    if args.quick and not args.diagnostic:
+        raise ValueError("Quick evaluation is restricted to smoke diagnostics")
+    if not args.diagnostic and args.decision is None:
+        raise ValueError(
+            "Freeze the research deployment decision before vLLM evaluation"
+        )
+    config, checkpoint = selected_checkpoint(
+        args.run,
+        diagnostic=args.diagnostic,
+        training_source=getattr(args, "training_source", None),
+    )
+    decision_hash = (
+        validate_decision(args.decision, checkpoint) if args.decision else None
+    )
+    model_path, exported = verify_export(args.export, checkpoint)
+    if exported["kind"] != "serving":
+        raise ValueError("vLLM evaluation requires a serving export")
+    rows, data_evidence = load_rows(config, args.tier)
+    if args.partition != "all":
+        rows = [row for row in rows if row["partition"] == args.partition]
+    if args.diagnostic:
+        rows = rows[:4]
+    gate = checkpoint["gate_path"] is not None
+    budgets = ((512, None) if args.quick else evaluation_budgets()) if gate else (None,)
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    source = capture_source(Path(__file__).resolve().parents[1], output)
+    settings = serving_settings(
+        model_path, config, rows, gate=gate, execution=args.execution
+    )
+    manifest = {
+        "engine": "vllm",
+        "execution": args.execution,
+        "checkpoint": checkpoint,
+        "tier": args.tier,
+        "partition": args.partition,
+        "ids": [row["id"] for row in rows],
+        "data": data_evidence,
+        "code_manifest_sha256": file_hash(source),
+        "decision_sha256": decision_hash,
+        "export": str(args.export.resolve()),
+        "export_status_sha256": file_hash(args.export / "status.json"),
+        "max_gen_tokens": config["max_gen_tokens"],
+        "budgets": budgets,
+        "settings": settings,
+    }
+    atomic_json(manifest, output / "evaluation.json")
+    runner = ServingRunner(settings, gate=gate)
+    manifest["runtime"] = runtime_evidence(serving=True)
+    atomic_json(manifest, output / "evaluation.json")
+    summaries = []
+    for budget in budgets:
+        directory = output / ("full" if budget is None else f"K{budget}")
+        directory.mkdir()
+        answers_path = directory / "answers.jsonl"
+        correct, ids = 0, []
+        with answers_path.open("x") as stream:
+            for answer in evaluate_serving_budget(
+                runner,
+                rows,
+                budget=budget,
+                cap=config["max_gen_tokens"],
+            ):
+                stream.write(json.dumps(answer, allow_nan=False) + "\n")
+                stream.flush()
+                ids.append(answer["id"])
+                correct += answer["accuracy"]
+        if ids != manifest["ids"]:
+            raise RuntimeError("Evaluation answers do not match the requested IDs")
+        summary = {
+            "budget": budget,
+            "accuracy": correct / len(ids),
+            "count": len(ids),
+            "answers_sha256": file_hash(answers_path),
+        }
+        atomic_json(summary, directory / "summary.json")
+        summaries.append(summary)
+        print(json.dumps(summary), flush=True)
+    atomic_json(
+        {
+            "complete": True,
+            "results": summaries,
+            "resolved_backends": runner.settings["resolved_backends"],
+            "resolved_compilation": runner.settings["resolved_compilation"],
+            "evaluation_sha256": file_hash(output / "evaluation.json"),
+            "numerical_agreement": "assessed separately",
+        },
+        output / "status.json",
+    )
+
+
+def reproduction_main(argv):
+    """Research evaluation and serving comparisons using the fixed protocol."""
+    from tokengate.e2e_gate.bench.benchmark_gate_e2e import run_serial_benchmark
+    from tokengate.e2e_gate.bench.benchmark_sanity_check import (
+        audit_quality,
+        collect_decode,
+        qualify_decode,
+        run_comparison,
+        run_serving_trace,
+    )
+    from tokengate.e2e_gate.bench.budget_selection import freeze_budget
+    from tokengate.e2e_gate.bench.export import export_run
+
+    handlers = {
+        "quality": run_research_evaluation,
+        "vllm-quality": run_serving_evaluation,
+        "export": export_run,
+        "benchmark": run_serial_benchmark,
+        "vllm-trace": run_serving_trace,
+        "compare": run_comparison,
+    }
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument(
+        "--stage",
+        required=True,
+        choices=[*handlers, "select-budget", "qualify", "audit"],
+    )
+    selection, remaining = selector.parse_known_args(argv)
+    stage = selection.stage
+    parser = argparse.ArgumentParser(description=f"NIAH {stage}")
+    parser.add_argument("--output", type=Path, required=True)
+    if stage != "select-budget":
+        parser.add_argument("--run", type=Path, required=True)
+    if stage in handlers:
+        parser.add_argument(
+            "--training-source",
+            type=Path,
+            help="Original frozen training source when using a separate inference revision",
+        )
+        parser.add_argument("--diagnostic", action="store_true")
+    if stage in {"quality", "vllm-quality", "benchmark", "vllm-trace", "qualify"}:
+        parser.add_argument(
+            "--tier",
+            choices=["16k", "32k"],
+            default="16k",
+            required=stage != "qualify",
+        )
+    if stage in {"quality", "vllm-quality", "benchmark"}:
+        parser.add_argument(
+            "--partition",
+            choices=["validation", "test", "all"],
+            required=True,
+        )
+        parser.add_argument("--decision", type=Path)
+    if stage in {"vllm-quality", "vllm-trace", "benchmark"}:
+        parser.add_argument("--export", type=Path, required=stage != "benchmark")
+    if stage in {"vllm-quality", "vllm-trace", "benchmark"}:
+        parser.add_argument(
+            "--execution", choices=["eager", "optimized"], default="eager"
+        )
+    if stage in {"vllm-quality", "vllm-trace"}:
+        parser.add_argument("--quick", action="store_true")
+
+    if stage == "export":
+        parser.add_argument("--vllm-source", type=Path, help="TokenGate vLLM fork checkout; defaults to the installed editable checkout")
+        parser.add_argument(
+            "--kind", choices=["serving", "merged-reference"], required=True
+        )
+    elif stage == "select-budget":
+        for name in ("validation", "baseline"):
+            parser.add_argument(f"--{name}", type=Path, required=True)
+    elif stage == "benchmark":
+        parser.add_argument("--quality", type=Path)
+        parser.add_argument(
+            "--qualification",
+            type=Path,
+            help="Completed qualify (original) or compare (vLLM) output; required for measurements",
+        )
+        parser.add_argument(
+            "--training-root",
+            type=Path,
+            help="Completed pipeline containing this run; defaults to the run's root",
+        )
+        parser.add_argument("--engine", choices=["research", "vllm"], required=True)
+        parser.add_argument("--budget", required=True)
+        parser.add_argument("--phase", choices=["prefill", "decode"], default="prefill")
+    elif stage == "vllm-trace":
+        parser.add_argument("--backend", choices=["auto", "triton"], default="auto")
+    elif stage == "compare":
+        for name in ("trace", "merged-export"):
+            parser.add_argument(f"--{name}", type=Path, required=True)
+    elif stage == "qualify":
+        for name in ("reference-source", "inference-source", "training-root"):
+            parser.add_argument(f"--{name}", type=Path, required=True)
+        parser.add_argument("--gpu", required=True)
+        parser.add_argument(
+            "--mode",
+            choices=("original", "revised", "callback"),
+            help=argparse.SUPPRESS,
+        )
+    elif stage == "audit":
+        for name in ("original", "revised", "evaluation", "qualification", "decision"):
+            parser.add_argument(f"--{name}", type=Path, required=True)
+        parser.add_argument("--compare-subset", type=Path, action="append", default=[])
+
+    args = parser.parse_args(remaining)
+    if stage == "select-budget":
+        freeze_budget(args.validation, args.baseline, args.output)
+    elif stage == "qualify":
+        if not args.gpu.isdecimal():
+            parser.error("Select one physical GPU index")
+        for name in (
+            "run",
+            "reference_source",
+            "inference_source",
+            "training_root",
+            "output",
+        ):
+            setattr(args, name, getattr(args, name).resolve())
+        if args.mode:
+            collect_decode(args, args.output / args.mode)
+        else:
+            qualify_decode(args)
+    elif stage == "audit":
+        record = audit_quality(args)
+        with args.output.open("x") as stream:
+            stream.write(json.dumps(record, indent=2, allow_nan=False) + "\n")
+    else:
+        handlers[stage](args)
 
 
 if __name__ == "__main__":

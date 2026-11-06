@@ -45,7 +45,7 @@ import os
 import pickle
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 # Pin the GPU *before* torch initialises CUDA.  The driver also sets this; doing
 # it here makes the worker correct when launched standalone.
@@ -63,31 +63,59 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tokengate.e2e_gate.gate_module.e2e_gate_module import load_gate  # noqa: E402
+from tokengate.datasets.tasks import get_task  # noqa: E402
+from tokengate.e2e_gate.attn.qwen3_flex_attention import (  # noqa: E402
+    set_gate_bias_for_layers,
+)
+from tokengate.e2e_gate.decode.gate_decode import generate_batch  # noqa: E402
 from tokengate.e2e_gate.gate_module.gate_forward import (  # noqa: E402
     apply_chat_template,
     find_article_boundaries,
     prefill_for_decode,
 )
-from tokengate.e2e_gate.attn.qwen3_flex_attention import (  # noqa: E402
-    GATE_ATTN,
-    patch_model_with_flex_attention,
-    set_attention_backends_for_layers,
-    set_gate_bias_for_layers,
-    get_full_attn_layer_indices,
-)
-from tokengate.e2e_gate.attn.flex_attention_utils import (  # noqa: E402
-    warmup_flex_attention,
-)
 from tokengate.generators import _strip_thinking  # noqa: E402
-from tokengate.e2e_gate.decode.gate_decode import generate_batch  # noqa: E402
-from tokengate.datasets.tasks import get_task  # noqa: E402
-
 
 DEVICE = "cuda"
 
 
 # ── timing ────────────────────────────────────────────────────────────────────
+
+from tokengate.e2e_gate.resources import available_gpus
+from tokengate.e2e_gate.bench.qualification import verify_qualification
+from tokengate.e2e_gate.bench.runtime import ResearchRunner, ServingRunner
+
+import fcntl
+import json
+import random
+import subprocess
+from pathlib import Path
+
+
+from tokengate.datasets.dataset import load_rows
+from tokengate.e2e_gate.artifacts import (
+    atomic_json,
+    capture_source,
+    file_hash,
+    runtime_evidence,
+)
+from tokengate.e2e_gate.bench.budget_selection import (
+    evaluation_budgets,
+    read_answers,
+    validate_decision,
+)
+from tokengate.e2e_gate.train.selection import selected_checkpoint
+from tokengate.inference import (
+    compile_layer_forward as compile_layer_forward,
+    _infer_lora_shape as _infer_lora_shape,
+    GATE_COMPILE as GATE_COMPILE,
+    load_gate_model,
+)
+from tokengate.e2e_gate.bench.runtime import (
+    serving_settings,
+    validate_retained_positions,
+)
+from tokengate.e2e_gate.bench.export import verify_export
+
 
 def _sync():
     if torch.cuda.is_available():
@@ -535,7 +563,6 @@ def measure_config(
 # ── model loading ──────────────────────────────────────────────────────────────
 
 
-
 def load_vanilla_model(base_model):
     from transformers import AutoModelForCausalLM
     # FlashAttention-2 explicitly (not "sdpa"): at bs>1 the SDPA path pads every
@@ -550,18 +577,6 @@ def load_vanilla_model(base_model):
         base_model, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2",
     ).to(DEVICE).eval()
     return m
-
-
-
-
-
-
-# Preserve benchmark imports while keeping model loading in the inference API.
-from tokengate.inference import (  # noqa: E402, F401
-    GATE_COMPILE, compile_layer_forward, load_gate_model,
-)
-
-
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
@@ -762,7 +777,7 @@ def main():
                 return ans, n_gen, [m["n_ctx"] for m in batch], pf, dec, st  # kept==ctx
             measure_config(args.out_dir, _label, -1, ds, tk, tokenizer, task, metas,
                            _vb, bs, args.max_new_tokens)
-        del vmodel
+        vmodel = None
         torch.cuda.empty_cache()
 
     def run_gate_pass():
@@ -821,7 +836,7 @@ def main():
                     gate.selection_mode = _saved_mode
             else:
                 _gate_point(-3, lambda metas: max(m["n_ctx"] for m in metas))
-        del gmodel, gate
+        gmodel = gate = None
         torch.cuda.empty_cache()
 
     # --gate-first runs the (fast, high-priority) gate K-sweep before the slow
@@ -838,6 +853,345 @@ def main():
         p()
 
     print(f"[worker gpu={args.gpu}] DONE", flush=True)
+
+
+
+
+
+
+
+
+def verify_exclusive_gpu(gpu: str) -> None:
+    """Reject measurements if another process appeared on the selected GPU."""
+    pids = subprocess.check_output(
+        [
+            "nvidia-smi",
+            f"--id={gpu}",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ],
+        text=True,
+    ).split()
+    if set(pids) != {str(os.getpid())}:
+        raise RuntimeError(f"Benchmark does not have exclusive GPU use: {pids}")
+
+
+def peak_memory(before: dict[str, int]) -> dict[str, int]:
+    """Separate total PyTorch peaks from allocations made during this request.
+
+    The starting allocation includes model weights and any preallocated cache
+    pool. The increase excludes those allocations; it is not total request
+    memory, since occupied vLLM cache pages come from the existing pool.
+    """
+    allocated = torch.cuda.max_memory_allocated()
+    reserved = torch.cuda.max_memory_reserved()
+    if allocated < before["allocated_bytes"] or reserved < before["reserved_bytes"]:
+        raise RuntimeError("Peak counters cannot be below their starting allocation")
+    return {
+        "before_request_allocated_bytes": before["allocated_bytes"],
+        "before_request_reserved_bytes": before["reserved_bytes"],
+        "peak_allocated_bytes": allocated,
+        "peak_reserved_bytes": reserved,
+        "peak_allocated_increase_bytes": allocated - before["allocated_bytes"],
+        "peak_reserved_increase_bytes": reserved - before["reserved_bytes"],
+    }
+
+
+def read_quality(directory: Path, expected: dict, budget: int | None) -> dict:
+    """Tie timings to completed quality scores from the same checkpoint and inputs."""
+    manifest = json.loads((directory / "evaluation.json").read_text())
+    status = json.loads((directory / "status.json").read_text())
+    if not status["complete"] or any(
+        manifest[key] != value for key, value in expected.items()
+    ):
+        raise ValueError("Benchmark requires matching completed quality evaluation")
+    (summary,) = [item for item in status["results"] if item["budget"] == budget]
+    answers = read_answers(
+        directory / ("full" if budget is None else f"K{budget}"),
+        summary,
+        expected["ids"],
+    )
+    return {answer["id"]: answer for answer in answers}
+
+
+def verify_completed_training(root: Path, config: dict) -> dict:
+    """Require a completed plan containing this exact checkpoint configuration.
+
+    A recovery plan can inherit completed runs from an earlier, failed pipeline.
+    The caller holds the selected root's experiment lock throughout timing.
+    """
+    status_path = root / "measured-training.json"
+    status = json.loads(status_path.read_text())
+    if status["state"] != "complete":
+        raise RuntimeError(
+            "Timing waits until the measured training pipeline completes"
+        )
+    plan_path = root / "configs/measured-plan.json"
+    if file_hash(plan_path) != status["plan_sha256"]:
+        raise ValueError("Completed training plan changed")
+    runs = json.loads(plan_path.read_text())["runs"]
+    if config not in runs:
+        raise ValueError("Checkpoint is not in the completed training plan")
+    planned_ids = [run["run_id"] for run in runs]
+    if (
+        len(set(planned_ids)) != len(planned_ids)
+        or [entry["run_id"] for entry in status["completed"]] != planned_ids
+    ):
+        raise ValueError("Completion evidence must include every planned run once")
+    for run, entry in zip(runs, status["completed"], strict=True):
+        output = Path(run["output_dir"])
+        run_status = output / "status.json"
+        if (
+            file_hash(run_status) != entry["status_sha256"]
+            or not json.loads(run_status.read_text())["complete"]
+            or json.loads((output / "params.json").read_text()) != run
+        ):
+            raise ValueError(f"Training completion evidence changed: {run['run_id']}")
+    return {
+        "root": str(root),
+        "plan_sha256": status["plan_sha256"],
+        "status_sha256": file_hash(status_path),
+    }
+
+
+def run_serial_benchmark(args: argparse.Namespace) -> None:
+    budget = None if args.budget == "full" else int(args.budget)
+    if budget not in evaluation_budgets():
+        raise ValueError("Budget is outside the fixed evaluation sweep")
+    if args.partition == "validation" and args.tier != "16k":
+        raise ValueError("32K reserved validation cannot select budgets/checkpoints")
+    if args.diagnostic and (args.partition != "validation" or args.tier != "16k"):
+        raise ValueError("Diagnostics must use 16K validation")
+    if not args.diagnostic and (
+        args.decision is None or args.quality is None or args.qualification is None
+    ):
+        raise ValueError(
+            "Measured benchmarks require frozen decisions, quality results and numerical qualification"
+        )
+    config, checkpoint = selected_checkpoint(
+        args.run, diagnostic=args.diagnostic, training_source=args.training_source
+    )
+    if args.execution != "eager" and (
+        args.engine != "vllm" or checkpoint["gate_path"] is not None
+    ):
+        raise ValueError("Optimized measurements currently support only vLLM SFT")
+    if checkpoint["gate_path"] is None and budget is not None:
+        raise ValueError("The SFT baseline requires the full budget")
+    if args.engine == "vllm" and args.export is None:
+        raise ValueError("vLLM benchmarks require the matched serving export")
+    model_path = None
+    if args.export is not None:
+        model_path, evidence = verify_export(args.export, checkpoint)
+        if args.engine != "vllm" or evidence["kind"] != "serving":
+            raise ValueError("Only vLLM benchmarks consume a serving export")
+    decision = validate_decision(args.decision, checkpoint) if args.decision else None
+    rows, data = load_rows(config, args.tier)
+    if args.partition != "all":
+        rows = [row for row in rows if row["partition"] == args.partition]
+    if args.diagnostic:
+        rows = rows[:4]
+    ids = [row["id"] for row in rows]
+    expected_quality = {
+        "checkpoint": checkpoint,
+        "engine": args.engine,
+        "execution": args.execution,
+        "ids": ids,
+        "tier": args.tier,
+        "partition": args.partition,
+        "data": data,
+    }
+    quality = (
+        read_quality(args.quality, expected_quality, budget) if args.quality else {}
+    )
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not gpu or "," in gpu:
+        raise ValueError("Select exactly one GPU with CUDA_VISIBLE_DEVICES")
+    available_gpus(gpu)
+    output = args.output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    training_root = (args.training_root or Path(config["root"])).resolve()
+    with (training_root / "experiment.lock").open("a") as lock:
+        training = None
+        if not args.diagnostic:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            training = verify_completed_training(training_root, config)
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+        if args.engine == "research":
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        source = capture_source(Path(__file__).resolve().parents[3], output)
+        manifest = {
+            "engine": args.engine,
+            "phase": args.phase,
+            "checkpoint": checkpoint,
+            "execution": args.execution,
+            "tier": args.tier,
+            "partition": args.partition,
+            "data": data,
+            "ids": ids,
+            "budget": budget,
+            "diagnostic": args.diagnostic,
+            "completed_training": training,
+            "output_tokens": 1 if args.phase == "prefill" else config["max_gen_tokens"],
+            "timing_boundaries": (
+                "pretokenized submission to first CPU token; cache inspection excluded"
+                if args.phase == "prefill"
+                else "first CPU token to final CPU token, including EOS; no cache inspection"
+            ),
+            "generation_timing_boundaries": (
+                "pretokenized submission to final CPU token; scoring excluded"
+                if args.phase == "decode"
+                else None
+            ),
+            "repetitions": 1 if args.diagnostic else 3,
+            "warmups_per_prompt": 1,
+            "memory_accounting": {
+                "peak": "PyTorch allocator peak, including weights and cache pools",
+                "increase": "peak minus allocation immediately before this request",
+                "cache": "content, occupied pages, and backing storage measured separately",
+            },
+            "decision_sha256": decision,
+            "source_manifest_sha256": file_hash(source),
+            "training_source": str(args.training_source.resolve())
+            if args.training_source
+            else str(Path(__file__).resolve().parents[3]),
+            "training_source_manifest_sha256": config["code_manifest_sha256"],
+            "quality_status_sha256": file_hash(args.quality / "status.json")
+            if args.quality
+            else None,
+            "export_status_sha256": file_hash(args.export / "status.json")
+            if args.export
+            else None,
+        }
+        atomic_json(manifest, output / "benchmark.json")
+        runner = (
+            ResearchRunner(config, checkpoint)
+            if args.engine == "research"
+            else ServingRunner(
+                serving_settings(
+                    model_path,
+                    config,
+                    rows,
+                    gate=checkpoint["gate_path"] is not None,
+                    execution=args.execution,
+                ),
+                gate=checkpoint["gate_path"] is not None,
+            )
+        )
+        manifest["runtime"] = runtime_evidence(serving=args.engine == "vllm")
+        manifest["qualification"] = None
+        if not args.diagnostic:
+            manifest["qualification"] = verify_qualification(
+                args.qualification,
+                engine=args.engine,
+                checkpoint=checkpoint,
+                tier=args.tier,
+                data=data,
+                budget=budget,
+                execution=args.execution,
+                source=Path(__file__).resolve().parents[3],
+                runtime=manifest["runtime"],
+                settings=runner.settings,
+                export_status_sha256=manifest["export_status_sha256"],
+                max_gen_tokens=config["max_gen_tokens"],
+            )
+        atomic_json(manifest, output / "benchmark.json")
+        atomic_json(runner.settings, output / "settings.json")
+        for row in rows:
+            if args.phase == "prefill":
+                runner.prefill(row, budget)
+            else:
+                runner.decode(row, budget, config["max_gen_tokens"])
+        order = [
+            (index, repetition)
+            for repetition in range(manifest["repetitions"])
+            for index in range(len(rows))
+        ]
+        random.Random(config["seed"]).shuffle(order)
+        with (output / "measurements.jsonl").open("x") as stream:
+            for index, repetition in order:
+                row = rows[index]
+                verify_exclusive_gpu(gpu)
+                torch.cuda.synchronize()
+                before = {
+                    "allocated_bytes": torch.cuda.memory_allocated(),
+                    "reserved_bytes": torch.cuda.memory_reserved(),
+                }
+                torch.cuda.reset_peak_memory_stats()
+                start = time.perf_counter()
+                if args.phase == "decode":
+                    record = runner.decode(row, budget, config["max_gen_tokens"])
+                    reference = quality.get(row["id"])
+                    if reference is not None and record["token_ids"] != reference.get(
+                        "token_ids"
+                    ):
+                        raise RuntimeError(
+                            "Decode output differs from quality evaluation"
+                        )
+                    record.update(
+                        **peak_memory(before),
+                        id=row["id"],
+                        repetition=repetition,
+                        budget=budget,
+                        prompt_tokens=row["ctx_len"],
+                    )
+                    if args.diagnostic:
+                        for key in (
+                            "generation_seconds",
+                            "decode_seconds",
+                            "decode_seconds_per_token",
+                        ):
+                            record[key] = None
+                    stream.write(json.dumps(record, allow_nan=False) + "\n")
+                    stream.flush()
+                    continue
+                token, context = runner.prefill(row, budget)
+                torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start
+                peaks = peak_memory(before)
+                memory = runner.inspect(context, row)
+                del context
+                validate_retained_positions(memory["kept_positions"], row, budget)
+                reference = quality.get(row["id"])
+                if reference is not None:
+                    if (
+                        reference.get("token_ids")
+                        and token != reference["token_ids"][0]
+                    ):
+                        raise RuntimeError(
+                            "First token differs from the quality evaluation"
+                        )
+                    if (
+                        reference["kept_positions"] is not None
+                        and memory["kept_positions"] != reference["kept_positions"]
+                    ):
+                        raise RuntimeError(
+                            "Retained positions differ from the quality evaluation"
+                        )
+                record = {
+                    "id": row["id"],
+                    "repetition": repetition,
+                    "budget": budget,
+                    "prompt_tokens": row["ctx_len"],
+                    "first_token": token,
+                    "ttft_seconds": None if args.diagnostic else elapsed,
+                    **peaks,
+                    **memory,
+                }
+                stream.write(json.dumps(record, allow_nan=False) + "\n")
+                stream.flush()
+        verify_exclusive_gpu(gpu)
+        atomic_json(
+            {
+                "complete": True,
+                "measurements_sha256": file_hash(output / "measurements.jsonl"),
+                "benchmark_sha256": file_hash(output / "benchmark.json"),
+                "settings_sha256": file_hash(output / "settings.json"),
+                "count": len(order),
+            },
+            output / "status.json",
+        )
 
 
 if __name__ == "__main__":
