@@ -434,4 +434,3 @@ def load_gate_model(base_model, gate_path, gate_layer, gate_attn="fa2",
               f"fp32 storage, compute in the backbone dtype ({_nf} CastLinears' bf16 copies frozen)", flush=True)
     print(f"[gate] ready (layer={gate_layer}, d_model={gate.d_model})", flush=True)
     return model, gate, input_all_prev_layers
-

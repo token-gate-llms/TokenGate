@@ -52,6 +52,7 @@ def prepare_runtime(root, cache, gpu, console):
     ).strip()
     identity = {
         "tokengate": revision,
+        "source": str(root),
         "vllm": VLLM_REVISION,
         "wheel": VLLM_WHEEL_REVISION,
         "python": list(sys.version_info[:2]),
@@ -136,12 +137,14 @@ def prepare_runtime(root, cache, gpu, console):
         [
             str(python),
             "-c",
-            "import vllm, tokengate, torch; "
-            "from vllm.config.token_gate import TokenGateConfig; "
-            "from vllm.third_party.flashmla.flash_mla_interface import flash_mla_with_kvcache; "
-            "from tokengate.inference import load_gate_model; "
-            "from tokengate.e2e_gate.decode.gate_decode import TokenDelivery; "
-            "assert torch.cuda.is_available(); print(vllm.__file__); print(tokengate.__file__)",
+            (
+                "import vllm, tokengate, torch; "
+                "from vllm.config.token_gate import TokenGateConfig; "
+                "from vllm.third_party.flashmla.flash_mla_interface import flash_mla_with_kvcache; "
+                "from tokengate.inference import load_gate_model; "
+                "from tokengate.e2e_gate.decode.gate_decode import TokenDelivery; "
+                "assert torch.cuda.is_available(); print(vllm.__file__); print(tokengate.__file__)"
+            ),
         ],
     )
     marker.write_text(json.dumps(identity, indent=2) + "\n")
