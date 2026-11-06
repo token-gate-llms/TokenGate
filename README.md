@@ -82,6 +82,12 @@ One gate serves every K: the planted needle is still answered verbatim with
 144 of 32,191 prompt tokens (0.4%) in the KV cache, at ~11× lower
 time-to-first-token.
 
+For a comparison with vLLM, open [inference-vllm.ipynb](examples/inference-vllm.ipynb).
+It downloads pinned code and checkpoints, runs Qwen3 and Qwen3.5 at K=64 and
+K=500, and compares answers and token-delivery latency. Checkpoint downloads
+require approval on each Hugging Face model page. The notebook includes its
+own setup and uses an isolated inference environment.
+
 ### Training
 
 Training looks like a TRL/PEFT recipe: a config object plus a trainer that
