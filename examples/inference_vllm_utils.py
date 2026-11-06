@@ -138,6 +138,7 @@ Path(sys.argv[2]).write_text(json.dumps(result, indent=2) + '\\n')
                     str(payload),
                     str(result_path),
                 ],
+                cwd=scratch,
                 env=env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
