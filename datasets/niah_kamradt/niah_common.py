@@ -28,7 +28,7 @@ from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
 PG_CACHE = Path(os.environ.get("NIAH_DATA_DIR", _HERE)) / "pg_essays.jsonl"
-MODEL_TOK = "Qwen/Qwen3-1.7B"   # sizing tokenizer (byte-identical to Qwen3-8B)
+MODEL_TOK = os.environ.get("NIAH_TOKENIZER", "Qwen/Qwen3-1.7B")
 
 _SENT_RE = re.compile(r"(?<=[.!?])\s+")
 
@@ -51,7 +51,11 @@ def load_pg_essays():
             raise RuntimeError(f"{PG_CACHE} exists but has only {len(rows)} rows; delete and re-fetch")
         return rows
     from datasets import load_dataset
-    ds = load_dataset("sgoel9/paul_graham_essays", split="train")
+    ds = load_dataset(
+        "sgoel9/paul_graham_essays",
+        revision=os.environ.get("NIAH_CORPUS_REVISION"),
+        split="train",
+    )
     rows = [{"title": r["title"], "text": " ".join(str(r["text"]).split())} for r in ds]
     if len(rows) < 200:
         raise RuntimeError(f"PG essay fetch returned {len(rows)} rows (<200) — wrong dataset?")

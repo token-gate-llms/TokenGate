@@ -20,7 +20,10 @@ from tokengate.datasets.prepare import prepare_dataset
 DATASET = "niah_kamradt_32k"
 TASK = "niah_kamradt_32k"
 _HERE = Path(__file__).resolve()
-JSONL = _HERE.parents[2] / "niah_kamradt" / "niah_kamradt_32k.jsonl"
+JSONL = (
+    Path(os.environ.get("NIAH_DATA_DIR", _HERE.parents[2] / "niah_kamradt"))
+    / "niah_kamradt_32k.jsonl"
+)
 OUTPUT_ROOT = Path(os.environ.get("PRETRAIN_DATA_ROOT", _HERE.parents[2]))
 MODEL = os.environ.get("PREPARE_MODEL", "Qwen/Qwen3-1.7B")  # e.g. Qwen/Qwen3.5-2B for the 32k tier of the hybrid gates
 

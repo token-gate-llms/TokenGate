@@ -48,10 +48,9 @@ import hashlib
 import json
 import os
 import pickle
-import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -293,6 +292,79 @@ def main():
     print(f"[pack] DONE  {total_rows} rows  {total_tok/1e6:.1f}M tokens  "
           f"({total_tok * np.dtype(TOKEN_DTYPE).itemsize / 1e9:.2f}GB packed)  "
           f"in {(time.time()-t0)/60:.1f} min")
+
+
+def epoch_order(count: int, seed: int, epoch: int) -> np.ndarray:
+    """Match the released packed-store shuffled-epoch sampler."""
+    order = np.arange(count)
+    np.random.default_rng(seed * 1_000_003 + epoch).shuffle(order)
+    return order
+
+
+class PackedTrainStore:
+    """List-of-dicts–compatible view over memory-mapped packed token data.
+
+    Replaces the in-RAM ``List[dict]`` of training rows used by the
+    pretraining-mixture loader.  Token ids live in per-dataset int32 ``.npy``
+    files opened with ``mmap_mode='r'`` — they are paged in on demand by the OS
+    and shared (one physical copy per node) across all ranks via the page
+    cache, instead of being unpickled into ~9x-larger Python ``int`` lists and
+    replicated per rank.  Only the small int64 ``meta`` table (one row of
+    indices/boundaries per sample) is resident in process RAM.
+
+    Indexing returns the exact dict shape a training step consumes
+    (``full_ids`` + boundaries + ``dataset``/``task``).  The raw article/target
+    *text* is intentionally absent — training never reads it (only the capped
+    eval set, loaded separately, keeps text).  Supports ``len()``,
+    ``store[i]`` and iteration, so ``random.choice`` / the shuffle-epoch
+    sampler work unchanged.  ``meta`` is a single concatenated array across
+    datasets, already sharded to this rank's slice.
+    """
+
+    __slots__ = ("_tok", "_ds_names", "_ds_tasks", "_meta")
+
+    def __init__(self, token_arrays, ds_names, ds_tasks, meta):
+        # token_arrays[k] is the mmap for dataset k; meta[:, DSI] indexes it.
+        self._tok = token_arrays
+        self._ds_names = ds_names
+        self._ds_tasks = ds_tasks
+        self._meta = meta  # (N, 8) int64: off,len,ctx,as,ae,nans,hash,dataset_idx
+
+    # meta column for dataset index (appended after HASH).
+    _DSI = 7
+
+    def __len__(self):
+        return int(self._meta.shape[0])
+
+    def __getitem__(self, i):
+        m = self._meta[i]
+        dsi = int(m[self._DSI])
+        off = int(m[OFF]); ln = int(m[LEN])
+        # .tolist() copies just this one row's tokens out of the mmap.
+        ids = self._tok[dsi][off:off + ln].tolist()
+        return {
+            "full_ids": ids,
+            "ctx_len": int(m[CTX]),
+            "article_start": int(m[AS]),
+            "article_end": int(m[AE]),
+            "n_ans": int(m[NANS]),
+            "dataset": self._ds_names[dsi],
+            "task": self._ds_tasks[dsi],
+        }
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+    # ── Vectorized helpers (avoid materializing dicts for bulk ops) ──────────
+    def article_lengths(self) -> "np.ndarray":
+        return self._meta[:, AE] - self._meta[:, AS]
+
+    def dataset_idx(self) -> "np.ndarray":
+        return self._meta[:, self._DSI]
+
+    def dataset_name(self, i: int) -> str:
+        return self._ds_names[int(self._meta[i, self._DSI])]
 
 
 if __name__ == "__main__":

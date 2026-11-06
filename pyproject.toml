@@ -27,6 +27,16 @@ train = ["wandb>=0.16", "matplotlib>=3.8"]
 # Metrics + data prep for specific datasets.
 data = ["rouge-score>=0.1.2", "pyarrow>=15.0"]
 
+# Recorded NIAH runtime; install a matching CUDA PyTorch build first.
+# The TokenGate-enabled vLLM fork is installed separately from its checkout.
+reproduction = [
+    "torch==2.14.0",
+    "transformers==5.22.1",
+    "triton==3.8.0; platform_system == 'Linux'",
+    "flash-linear-attention==0.6.0; platform_system == 'Linux'",
+    "pytest>=8",
+]
+
 [project.urls]
 Repository = "https://github.com/tokengate-models/TokenGate"
 

@@ -66,7 +66,7 @@ class TokenGateConfig:
 
     # ── Model / gate (required) ──────────────────────────────────────────────
     base_model: str                 # HF model id, e.g. "Qwen/Qwen3-1.7B"
-    gate_layer: int                 # layer L whose hidden states the gate scores
+    gate_layer: Optional[int]       # None trains the full-context SFT adapter
     output_dir: str                 # where gate_final.pt / checkpoints / curves land
     # ── Schedule (required) ──────────────────────────────────────────────────
     learning_rate: float
@@ -122,7 +122,7 @@ class TokenGateConfig:
     eval_group_override: Optional[str] = None
     eval_test_full_tasks: Optional[List[str]] = None
     # ── Kernels (None = resolved from the model family, like the driver) ─────
-    attn_backend: Optional[str] = None     # "fa2" | "flash" | "flex"
+    attn_backend: Optional[str] = None     # "fa2" | "flash" | "flex"; SFT uses "sdpa"
     compile_phase2: Optional[bool] = None
     pack_phase2: Optional[bool] = None
     pack_phase2_max_tokens: int = 12288
@@ -172,6 +172,9 @@ class TokenGateConfig:
         if self.nnodes > 1 and (self.node_rank is None or self.master_addr is None):
             raise ValueError("nnodes>1 requires node_rank (0..nnodes-1, per node) "
                              "and master_addr (the rank-0 node)")
+        if self.gate_layer is None:
+            self.attn_backend = "sdpa"
+            self.compile_phase2 = self.pack_phase2 = False
         if self.attn_backend is None:
             # Same per-family kernel defaults as the shell driver; unknown
             # families must choose explicitly rather than inherit a wrong kernel.
@@ -363,7 +366,7 @@ class TokenGateTrainer:
             "--base-model", c.base_model,
             "--dataset", self._dataset,
             "--task", self._task,
-            "--gate-layer", str(c.gate_layer),
+            "--gate-layer", str(c.gate_layer if c.gate_layer is not None else 0),
             "--epochs", str(c.epochs),
             "--lr", str(c.learning_rate),
             "--seed", str(c.seed),
@@ -392,6 +395,8 @@ class TokenGateTrainer:
             "--pretrain-data-root", c.data_root,
             "--eval-split-manifest", self.eval_split_path,
         ]
+        if c.gate_layer is None:
+            args += ["--no-gate"]
         if c.optim != "adamw":
             args += ["--optimizer", c.optim]
         args += ["--weight-decay", str(c.weight_decay)]
@@ -459,6 +464,19 @@ class TokenGateTrainer:
             cmd += [f"--nnodes={c.nnodes}", f"--node_rank={c.node_rank}",
                     f"--master_addr={c.master_addr}"]
         return cmd + ["-m", _TRAIN_MODULE] + self._trainer_args()
+
+    @staticmethod
+    def reproduction_command(config_path: Path, *, resume=False, stop_after=None) -> List[str]:
+        """Launch the fixed SFT/gate protocol from a recorded run configuration."""
+        config = json.loads(Path(config_path).read_text())
+        command = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+                   f"--nproc-per-node={config['world_size']}", "-m", _TRAIN_MODULE,
+                   "--reproduction-config", str(config_path)]
+        if resume:
+            command.append("--resume")
+        if stop_after is not None:
+            command += ["--stop-after", str(stop_after)]
+        return command
 
     def _env(self) -> dict:
         env = dict(os.environ)

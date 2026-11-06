@@ -13,7 +13,7 @@ import warnings
 import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.nn.attention.flex_attention import flex_attention, create_block_mask
+from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
 from typing import Optional, Callable, Dict, Tuple
 from collections import OrderedDict
 
@@ -262,6 +262,10 @@ def flex_attention_gate_bias(
     in the regular autograd graph, avoiding FlexAttention inductor backward
     constraints on captured grad tensors.
 
+    Deterministic CUDA training uses a fixed-order key-bias reduction because
+    FlexAttention's captured-tensor backward uses atomic additions. The forward
+    and query/key/value gradients remain FlexAttention operations.
+
     Args:
         Q, K, V: Attention tensors (B, H, S, D)
         gate_bias: Gate bias tensor, pre-scaled by attn_scale if applicable.
@@ -279,10 +283,25 @@ def flex_attention_gate_bias(
     kv_len = K.shape[2]
     device = Q.device
 
-    _gate_bias_state.bias = gate_bias.to(device)
+    gate_bias = gate_bias.to(device)
+    deterministic_bias = (
+        torch.is_grad_enabled()
+        and gate_bias.requires_grad
+        and torch.are_deterministic_algorithms_enabled()
+        and Q.is_cuda
+    )
+    _gate_bias_state.bias = gate_bias.detach() if deterministic_bias else gate_bias
     score_mod = _gate_bias_per_head_score_mod if per_head else _gate_bias_score_mod
 
     block_mask = get_causal_block_mask(max(q_len, kv_len), device, use_bucketing=False)
+    if deterministic_bias:
+        from tokengate.e2e_gate.attn.flex_bias_backward import attach_bias_gradient
+
+        output, lse = flex_attention(
+            Q, K, V, score_mod=score_mod, block_mask=block_mask,
+            enable_gqa=_gqa(Q, K), return_lse=True,
+        )
+        return attach_bias_gradient(output, Q, K, V, gate_bias, lse, per_head)
     return flex_attention(Q, K, V, score_mod=score_mod, block_mask=block_mask,
                           enable_gqa=_gqa(Q, K))
 

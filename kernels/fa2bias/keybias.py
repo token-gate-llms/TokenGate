@@ -54,7 +54,8 @@ def _bwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, 
          lse: torch.Tensor, bias_raw: torch.Tensor, scale: float,
          causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dq, dk, dv, _, dbias = ext().bwd(dout, q, k, v, out, lse, None, None, None, bias_raw,
-                                     0.0, scale, causal, -1, -1, 0.0, False, None, None)
+                                     0.0, scale, causal, -1, -1, 0.0,
+                                     torch.are_deterministic_algorithms_enabled(), None, None)
     return dq, dk, dv, dbias
 
 
@@ -106,7 +107,8 @@ def _vbwd(dout: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
           causal: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     dq, dk, dv, _, dbias = ext().varlen_bwd(dout, q, k, v, out, lse, None, None, None, cu_seqlens, cu_seqlens,
                                             bias_raw, max_seqlen, max_seqlen, 0.0, scale, False, causal,
-                                            -1, -1, 0.0, False, None, None)
+                                            -1, -1, 0.0,
+                                            torch.are_deterministic_algorithms_enabled(), None, None)
     return dq, dk, dv, dbias
 
 

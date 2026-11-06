@@ -389,7 +389,6 @@ def is_linear_attention_layer(layer: nn.Module) -> bool:
     return layer_type == "linear_attention"
 
 
-
 def _attn_only_forward_eager(layer, hidden_states, position_ids, cache, cache_pos, pe):
     """The gate layer's forward UP TO the token-mixer residual: returns a_j.
 
@@ -813,7 +812,7 @@ def run_phase1_forward(
         # Frozen prefix: layers 0..lora_start_layer-1 (no grad needed)
         # When lora_start_layer==0 this loop is empty (range(0)=[]).
         with torch.no_grad():
-            for i in range(lora_start_layer):
+            for i in range(min(lora_start_layer, gate_layer + 1)):
                 hidden_states = inner.layers[i](
                     hidden_states,
                     attention_mask=None,
@@ -1633,7 +1632,7 @@ def forward_with_gate_batched(
         # Frozen prefix: layers 0..lora_start_layer-1
         # When lora_start_layer==0 this loop is empty (range(0)=[]).
         with torch.no_grad():
-            for i in range(lora_start_layer):
+            for i in range(min(lora_start_layer, gate_layer + 1)):
                 hidden_states = _run_layer(i)
         # LoRA-enabled suffix: layers lora_start_layer..gate_layer
         with torch.enable_grad():
@@ -1802,10 +1801,12 @@ def forward_lora_baseline_batched(
     model: torch.nn.Module,
     batch_data: List[dict],
     frozen_backbone: bool = True,
+    *,
+    answer_only: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Vanilla full-model forward pass for the no-gate LoRA baseline.
 
-    Runs the entire model end-to-end with FlexAttention causal masking (no
+    Runs the entire model with its configured causal attention (no
     Phase 1/Phase 2 split, no gate bias, no token pruning), then builds a
     loss mask covering the answer positions of each batch element.
 
@@ -1814,13 +1815,13 @@ def forward_lora_baseline_batched(
     positions are masked out of the loss.
 
     Args:
-        model: Transformer model (FlexAttention-patched).
+        model: Transformer model, with native or patched attention.
         batch_data: List of dicts with keys input_ids (List[int]), ctx_len, n_ans.
-        frozen_backbone: If True, run all layers under no_grad EXCEPT LoRA-wrapped
-            attention projections, which always allow gradients (LoRA wraps the
-            frozen base linear with trainable lora_A/B and the wrapper's autograd
-            graph is established at the parameter level).  When False, the whole
-            model runs under enable_grad (standard fine-tuning).
+        frozen_backbone: Kept for compatibility; parameter requires_grad flags
+            control training. Evaluation respects the caller's no_grad context.
+        answer_only: For a single unpadded sample, compute vocabulary logits only
+            for the answer and final input position. Avoids the large unused
+            prompt-by-vocabulary tensor during SFT and serial validation.
 
     Returns:
         logits: (B, max_seq_len, vocab_size)
@@ -1830,6 +1831,8 @@ def forward_lora_baseline_batched(
     inner = model.model
     device = next(model.parameters()).device
     batch_size = len(batch_data)
+    if answer_only and batch_size != 1:
+        raise ValueError("Answer-only logits require a single unpadded sample")
 
     # Pad input sequences to max length in batch (right-padding with id 0).
     max_seq_len = max(len(item["input_ids"]) for item in batch_data)
@@ -1845,15 +1848,11 @@ def forward_lora_baseline_batched(
     set_gate_bias_for_layers(model, 0, n_layers, None)
     set_attn_scale_for_layers(model, 0, n_layers, None)
 
-    # Forward.  LoRA adapter parameters keep requires_grad=True regardless of
-    # frozen_backbone, so a single enable_grad context lets their gradients
-    # flow even though the underlying nn.Linear weights are frozen.  When
-    # frozen_backbone=False, this same context covers the unfrozen backbone.
-    with torch.enable_grad():
-        outputs = model(input_ids, use_cache=False)
-    logits = outputs.logits  # (B, max_seq_len, vocab_size)
+    kwargs = {"logits_to_keep": batch_data[0]["n_ans"] + 1} if answer_only else {}
+    logits = model(input_ids, use_cache=False, **kwargs).logits
+    offset = max_seq_len - logits.shape[1]
 
-    loss_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=logits.device)
+    loss_mask = torch.zeros(logits.shape[:2], dtype=torch.bool, device=logits.device)
     padding_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=logits.device)
     for b_idx, item in enumerate(batch_data):
         seq_len = len(item["input_ids"])
@@ -1861,9 +1860,9 @@ def forward_lora_baseline_batched(
         n_ans = item["n_ans"]
         padding_mask[b_idx, :seq_len] = True
         # The logit at position ctx_len-1 predicts the first answer token.
-        ans_start_logit = ctx_len - 1
+        ans_start_logit = ctx_len - 1 - offset
         ans_end_logit = ans_start_logit + n_ans
-        if ans_end_logit <= seq_len:
+        if 0 <= ans_start_logit < ans_end_logit <= logits.shape[1]:
             loss_mask[b_idx, ans_start_logit:ans_end_logit] = True
 
     return logits, loss_mask, padding_mask
@@ -1964,7 +1963,7 @@ def forward_backward_with_gate_multi_K_detach(
                 hidden_states = _run_layer(i)
     elif lora_start_layer >= 0:
         with torch.no_grad():
-            for i in range(lora_start_layer):
+            for i in range(min(lora_start_layer, gate_layer + 1)):
                 hidden_states = _run_layer(i)
         with torch.enable_grad():
             for i in range(lora_start_layer, gate_layer + 1):

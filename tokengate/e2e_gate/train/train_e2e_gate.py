@@ -23,7 +23,6 @@ torchrun -m tokengate.e2e_gate.train.train_e2e_gate \\
 """
 
 import argparse
-import asyncio
 import copy
 import csv
 import datetime
@@ -49,6 +48,18 @@ try:
     _HAVE_MPL = True
 except ImportError:
     _HAVE_MPL = False
+
+
+from pathlib import Path
+
+import torch
+import torch._functorch.config
+
+from tokengate.datasets.tasks.niah import NiahKamradtTask
+from tokengate.datasets.pack import PackedTrainStore, epoch_order
+from tokengate.datasets.dataset import validation_rows
+from tokengate.e2e_gate.train.selection import CheckpointSelection, averaged_parameters, restore_rng, rng_state, save_weights, trainable_parameters
+from tokengate.e2e_gate.artifacts import atomic_json, atomic_save, verify_source
 
 
 def _make_param_heatmap(tensor: "torch.Tensor", title: str) -> "wandb.Image":
@@ -93,7 +104,6 @@ def _validate_cache_prompt_version(cache_dict: dict, task, cache_path: str) -> N
 
 
 import numpy as np
-import torch
 import torch._dynamo  # noqa: F401 (eagerly bind so torch._dynamo.reset() works inside train())
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -113,38 +123,47 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from tokengate.e2e_gate.gate_module.e2e_gate_module import set_gate_diag_stats  # noqa: E402
-from tokengate.e2e_gate.gate_module.e2e_gate_module import (
-    E2EGate, save_gate, load_gate, assert_fp32_params, swa_inplace_update,
+from tokengate.datasets.tasks import (
+    PRETRAIN_VAL_CATEGORIES,
+    Task,
+    get_task,
+    get_task_category,
 )
 from tokengate.e2e_gate.attn.flex_attention_utils import (
-    flex_attention_causal,
-    flex_attention_gate_bias,
     warmup_flex_attention,
-    get_block_mask_cache_stats,
 )
 from tokengate.e2e_gate.attn.qwen3_flex_attention import (
     GATE_ATTN,
-    set_attention_backends_for_layers,
-    patch_model_with_flex_attention,
-    set_gate_bias_for_layers,
     get_full_attn_layer_indices,
+    patch_model_with_flex_attention,
+    set_attention_backends_for_layers,
+    set_gate_bias_for_layers,
     set_phase2_stats_enabled,
+)
+from tokengate.e2e_gate.attn.qwen3_flex_attention import (
     _phase2_attn_stats_buf as _flex_attn_stats_buf,
 )
-from tokengate.e2e_gate.gate_module.gate_forward import (
-    apply_chat_template,
-    find_article_boundaries,
-    compute_prunable_span,
-    forward_lora_baseline_batched,
-    forward_with_gate_batched,
-)
 from tokengate.e2e_gate.decode.gate_decode import generate_batch
+
 # Module alias so the profile path can read the opt-in PHASE_TIMING global
 # (populated per step by forward_backward_with_gate_multi_K_detach when
 # PROFILE_PHASES=1).  See training_bench/bench_homogenization.sh.
 from tokengate.e2e_gate.gate_module import gate_forward as _gate_forward_mod
-from tokengate.datasets.tasks import get_task, get_task_category, PRETRAIN_VAL_CATEGORIES
+from tokengate.e2e_gate.gate_module.e2e_gate_module import (
+    E2EGate,
+    assert_fp32_params,
+    load_gate,
+    save_gate,
+    set_gate_diag_stats,  # noqa: E402
+    swa_inplace_update,
+)
+from tokengate.e2e_gate.gate_module.gate_forward import (
+    apply_chat_template,
+    compute_prunable_span,
+    find_article_boundaries,
+    forward_lora_baseline_batched,
+    forward_with_gate_batched,
+)
 
 try:
     import matplotlib
@@ -169,7 +188,6 @@ def _sarle_bimodality(b_np) -> Optional[float]:
     Returns None on degenerate inputs (n < 4, zero variance, or non-positive
     denominator).
     """
-    import numpy as np
     n = b_np.size
     if n < 4:
         return None
@@ -380,8 +398,8 @@ def evaluate(
         mean_n_tokens_pruned_art / mean_n_tokens_full_art to read the gate's
         article-level kept fraction (matches train/mean_kept_frac semantics).
     """
-    from tokengate.generators import _strip_thinking
-    gate.eval()
+    if gate is not None:
+        gate.eval()
     model.eval()
 
     def _task_of(_s):
@@ -704,8 +722,9 @@ def evaluate(
     # so we can report `eval/sparsity_loss` as the matching component of the
     # eval loss decomposition (ce + sparsity, same as training).
     _gate_inner_eval = gate.module if hasattr(gate, "module") else gate
-    _gate_inner_eval._sparsity_term = None
-    _gate_inner_eval._sparsity_eval_capture = True
+    if gate is not None:
+        _gate_inner_eval._sparsity_term = None
+        _gate_inner_eval._sparsity_eval_capture = True
     # Pad-budget chunking (mirrors the prefill chunker): fixed size-4 batches of
     # ~24k-token rows OOM'd every mini-batch under the 39k eval cap, and the
     # except below SKIPPED them silently — the whole group's loss printed 0.0
@@ -732,6 +751,11 @@ def evaluate(
     for _chunk in _loss_chunks:
         _mini = [loss_batch_items[_j] for _j in _chunk]
         try:
+            if gate is None:
+                with torch.no_grad():
+                    total_loss += sum(float(answer_loss(model, row)) for row in _mini)
+                n_loss_valid += len(_mini)
+                continue
             # no_grad is essential: this reuses the TRAINING forward, and with any
             # trainable adapter attached, grad mode retains the full-sequence
             # activations of all 36 layers for a backward that never runs —
@@ -769,12 +793,14 @@ def evaluate(
     # _spars_term is a tensor sum-of-soft over the rank's eval samples;
     # multiply by lambda → rank-local sparsity-loss SUM (per-sample-mean is
     # taken after the cross-rank all_reduce, paralleling CE).
-    _gate_inner_eval._sparsity_eval_capture = False
+    if gate is not None:
+        _gate_inner_eval._sparsity_eval_capture = False
     _spars_term = getattr(_gate_inner_eval, "_sparsity_term", None)
     total_sparsity_loss = 0.0
     if _spars_term is not None and sparsity_lambda != 0.0:
         total_sparsity_loss = float((sparsity_lambda * _spars_term).detach().item())
-    _gate_inner_eval._sparsity_term = None
+    if gate is not None:
+        _gate_inner_eval._sparsity_term = None
 
     # ── Aggregate across ranks ────────────────────────────────────────────────
     _stats = torch.tensor(
@@ -917,9 +943,11 @@ def evaluate_no_compression(
         f1_metric_tag}} bucketed from the SAME generations (rank 0 only; other
         ranks return {}).  Mirrors the gated eval's cheap-extra per-ds breakdown.
     """
-    from tokengate.generators import _strip_thinking
     from tokengate.e2e_gate.attn.qwen3_flex_attention import (
-        set_attn_scale_for_layers, set_ssmax_ratio_for_layers)
+        set_attn_scale_for_layers,
+        set_ssmax_ratio_for_layers,
+    )
+    from tokengate.generators import _strip_thinking
     model.eval()
     inner = model.model
     # Audit fix (2026-08-28): clear any stale gate bias / attn_scale / ssmax
@@ -1222,72 +1250,6 @@ def _clip_cell(v, n: int = _WANDB_CELL_MAX_CHARS):
     return v
 
 
-class PackedTrainStore:
-    """List-of-dicts–compatible view over memory-mapped packed token data.
-
-    Replaces the in-RAM ``List[dict]`` of training rows used by the
-    pretraining-mixture loader.  Token ids live in per-dataset int32 ``.npy``
-    files opened with ``mmap_mode='r'`` — they are paged in on demand by the OS
-    and shared (one physical copy per node) across all ranks via the page
-    cache, instead of being unpickled into ~9x-larger Python ``int`` lists and
-    replicated per rank.  Only the small int64 ``meta`` table (one row of
-    indices/boundaries per sample) is resident in process RAM.
-
-    Indexing returns the exact dict shape a training step consumes
-    (``full_ids`` + boundaries + ``dataset``/``task``).  The raw article/target
-    *text* is intentionally absent — training never reads it (only the capped
-    eval set, loaded separately, keeps text).  Supports ``len()``,
-    ``store[i]`` and iteration, so ``random.choice`` / the shuffle-epoch
-    sampler work unchanged.  ``meta`` is a single concatenated array across
-    datasets, already sharded to this rank's slice.
-    """
-
-    __slots__ = ("_tok", "_ds_names", "_ds_tasks", "_meta")
-
-    def __init__(self, token_arrays, ds_names, ds_tasks, meta):
-        # token_arrays[k] is the mmap for dataset k; meta[:, DSI] indexes it.
-        self._tok = token_arrays
-        self._ds_names = ds_names
-        self._ds_tasks = ds_tasks
-        self._meta = meta  # (N, 8) int64: off,len,ctx,as,ae,nans,hash,dataset_idx
-
-    # meta column for dataset index (appended after pack.HASH).
-    _DSI = 7
-
-    def __len__(self):
-        return int(self._meta.shape[0])
-
-    def __getitem__(self, i):
-        from tokengate.datasets import pack
-        m = self._meta[i]
-        dsi = int(m[self._DSI])
-        off = int(m[pack.OFF]); ln = int(m[pack.LEN])
-        # .tolist() copies just this one row's tokens out of the mmap.
-        ids = self._tok[dsi][off:off + ln].tolist()
-        return {
-            "full_ids": ids,
-            "ctx_len": int(m[pack.CTX]),
-            "article_start": int(m[pack.AS]),
-            "article_end": int(m[pack.AE]),
-            "n_ans": int(m[pack.NANS]),
-            "dataset": self._ds_names[dsi],
-            "task": self._ds_tasks[dsi],
-        }
-
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-
-    # ── Vectorized helpers (avoid materializing dicts for bulk ops) ──────────
-    def article_lengths(self) -> "np.ndarray":
-        from tokengate.datasets import pack
-        return self._meta[:, pack.AE] - self._meta[:, pack.AS]
-
-    def dataset_idx(self) -> "np.ndarray":
-        return self._meta[:, self._DSI]
-
-    def dataset_name(self, i: int) -> str:
-        return self._ds_names[int(self._meta[i, self._DSI])]
 
 
 def _target_balanced_index_weights(map_path, ds_names, ds_tasks, row_counts, is_main):
@@ -1791,10 +1753,42 @@ def _save_train_state(
 
 
 def train(args):
+    # A reproduction recipe selects options and evidence policy for this trainer;
+    # it never supplies a separate model setup or optimization loop.
+    protocol = getattr(args, "reproduction", None)
+    strict = protocol is not None
+    resume_state = None
+    selection = None
+    prior_seconds = 0.0
+    if strict:
+        verify_source(Path(__file__).resolve().parents[3], Path(protocol["code_manifest"]),
+                      protocol["code_manifest_sha256"])
+        output = Path(args.output_dir)
+        if (output / "params.json").exists():
+            if not args.reproduction_resume or json.loads((output / "params.json").read_text()) != protocol:
+                raise ValueError("Existing run requires explicit resume with identical config")
+        elif args.reproduction_resume:
+            raise ValueError("Cannot resume a run without recorded parameters")
+        if args.reproduction_resume:
+            resume_state = torch.load(output / "train_state.pt", map_location="cpu", weights_only=False)
+            if resume_state["config"] != protocol:
+                raise ValueError("Resume checkpoint configuration differs")
+            prior_seconds = resume_state["elapsed_seconds"]
+        selection = CheckpointSelection(**resume_state["selection"]) if resume_state else CheckpointSelection(
+            protocol["patience"], protocol["warmup_steps"])
     # ── Distributed setup ─────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     rank       = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if strict:
+        if world_size != protocol["world_size"]:
+            raise ValueError("Launch topology differs from the recorded effective batch")
+        cache = Path(protocol["root"]) / "cache" / protocol["run_id"] / f"rank{rank}"
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache / "inductor")
+        os.environ["TRITON_CACHE_DIR"] = str(cache / "triton")
+        torch.use_deterministic_algorithms(protocol["deterministic"])
+        torch._functorch.config.donated_buffer = False
 
     # ── Make the first-step torch.compile survivable under DDP ───────────────
     # The first training step compiles the FlexAttention kernels for the run's
@@ -1860,7 +1854,8 @@ def train(args):
     # device.  Use args.seed + rank so each rank has a distinct but reproducible
     # RNG stream.  Rank 0 gets args.seed exactly so the no-compress eval (rank 0
     # only) is reproducible across runs with the same --seed.
-    _seed = args.seed + rank
+    _seed = args.seed if strict else args.seed + rank
+    np.random.seed(_seed)
     random.seed(_seed)
     torch.manual_seed(_seed)
     torch.cuda.manual_seed(_seed)
@@ -1902,10 +1897,13 @@ def train(args):
 
     if is_main:
         # Save params
-        params = vars(args)
+        import uuid
+        params = protocol or {**vars(args), "run_id": uuid.uuid4().hex}
         with open(os.path.join(args.output_dir, "params.json"), "w") as f:
             json.dump(params, f, indent=2)
         print(f"[train] Params saved to {args.output_dir}/params.json")
+        if strict:
+            (output / "validation").mkdir(exist_ok=True)
 
         # ── W&B init ─────────────────────────────────────────────────────────
         _wandb_run = None
@@ -2019,8 +2017,8 @@ def train(args):
             _DELTA_DEFAULT_TARGETS,
             apply_delta_to_layers,
             apply_lora_to_layers,
-            collect_lora_params,
             collect_lora_named_params,
+            collect_lora_params,
             collect_lora_state_dict,
             load_lora_state_dict,
             resolve_all_adapter_layers,
@@ -2085,115 +2083,138 @@ def train(args):
         if is_main:
             print("[train] Gradient checkpointing ENABLED on backbone (use_reentrant=False).")
 
-    # ── Gate ──────────────────────────────────────────────────────────────────
-    n_heads = model.config.num_attention_heads
-    # The gate layer may be ANY layer (run-17: gate at a DeltaNet layer is a
-    # deliberate variant — the a_j split dispatches to linear_attn in
-    # _attn_only_forward_eager, and the gate branch clones the layer's MLP,
-    # which every hybrid layer has). Bias still lands only on the FULL-attn
-    # layers above L; a DeltaNet gate layer simply contributes scoring, not a
-    # biased mixer. Print the layout so the config is visible in the log.
-    _full_attn_indices = get_full_attn_layer_indices(model)
-    if args.gate_layer >= len(model.model.layers) - 1:
-        raise ValueError(f"gate_layer={args.gate_layer} leaves no Phase-2 layers")
-    if is_main and args.gate_layer not in _full_attn_indices:
-        print(f"[train] gate_layer={args.gate_layer} is a LINEAR-ATTENTION "
-              f"(DeltaNet) layer — scoring reads its hidden state; bias applies "
-              f"to full-attn layers {[i for i in _full_attn_indices if i > args.gate_layer]}")
-    # n_layers_bias: number of Phase-2 layers that receive the gate bias.
-    # For Qwen3.5 hybrid only the FULL-attention layers strictly above the gate
-    # layer are biased (linear-attn/DeltaNet layers carry no per-token KV bias in
-    # the current baseline). For homogeneous Qwen3 this equals num_layers-L-1.
-    _full_attn_above_L = [i for i in _full_attn_indices if i > args.gate_layer]
-    n_layers_bias = len(_full_attn_above_L)
-    gate = E2EGate(
-        d_model=d_model,
-        n_heads=n_heads,
-        n_layers_bias=n_layers_bias,
-        selection_mode=args.gate_selection,
-        tau=args.tau,
-    ).to(device).to(torch.float32)
-    # Dedicated SCORING branch (--gate-branch): unties the token-ranking readout from
-    # the hidden state that gets FORWARDED to layer gate_layer+1. Hypothesis: the layer-0
-    # delta adapter is weight-tied across two incompatible jobs. The forward path is
-    # UNCHANGED (delta-adapted layer 0, Phase-2 biases, learnable gate_scale/attn_scale);
-    # only the gate projection's input changes. Built from the CURRENT layer weights, so
-    # at init h_gate == h_fwd and the model is byte-identical to the tied architecture.
-    # Attached to `gate` so gate.parameters() (optimizer + _sync_params + SWA) covers it.
-    # gate_scale init: beta = softplus^-1(s_l) from the pretrained qk-norm gains
-    # (set_qk_norm_scales) — the bias starts at ~one native logit-sigma per layer.
-    _qk_s_l_vals = gate.set_qk_norm_scales(model, args.gate_layer)
-    if rank == 0:
-        print(f"[train] gate_scale init: s_l = ||g_q (.) g_k||_2/sqrt(d) per phase-2 layer "
-              f"(min={min(_qk_s_l_vals):.3f} mean={sum(_qk_s_l_vals)/len(_qk_s_l_vals):.3f} "
-              f"max={max(_qk_s_l_vals):.3f}); gate_scale LEARNABLE softplus(beta), "
-              f"init softplus^-1(s_l); temperature: s_eff = r * softplus(sigma), init 1; "
-              f"b_norm gain FROZEN at {float(gate.b_norm.weight.item()):.2f}",
-              flush=True)
-    if rank == 0 and args.wandb_project:
-        import wandb as _wandb_slog
-        _sl_log = {f"train/s_l/layer{args.gate_layer + 1 + _i}": _v
-                   for _i, _v in enumerate(_qk_s_l_vals)}
-        _sl_log["train/s_l_mean"] = sum(_qk_s_l_vals) / len(_qk_s_l_vals)
-        _sl_log["train/s_l_min"] = min(_qk_s_l_vals)
-        _sl_log["train/s_l_max"] = max(_qk_s_l_vals)
-        _wandb_slog.log(_sl_log, step=0)
-
-
-    from tokengate.e2e_gate.gate_module.gate_forward import build_gate_branch
-    _br = build_gate_branch(model, gate, args.gate_layer).to(device)
-    if is_main:
-        print(f"[train] GATE BRANCH: dedicated scoring branch "
-              f"init from layer {args.gate_layer} "
-              f"({sum(p.numel() for p in _br.parameters()) / 1e6:.2f}M trainable, "
-              f"fp32 storage, compute in the backbone dtype). "
-              "Split active: Phase 1 ends at a_j; the layer's own MLP runs "
-              "on kept tokens in Phase 2.")
-
-    # Plumb the sparsity-penalty config onto the gate object so
-    # gate_forward._accumulate_gate_sparsity can read it on each forward.
-    # (E2EGate's __init__ doesn't accept these — they're train-time-only.)
-    gate.sparsity_mode = args.sparsity_mode
-    gate.sparsity_sharpness = float(args.sparsity_sharpness)
-    # --random-topk: replace gate top-K with a uniform random K-subset of article
-    # tokens (see gate_forward._select_topk_or_random).  Freeze all gate params so
-    # the gate stays at zero-init throughout (b=0 → no Phase 2 attention bias);
-    # the gate runs forward but its output is functionally a no-op besides
-    # selecting K positions at random.
-    if getattr(args, "random_topk", False):
-        gate.random_topk = True
-        for p in gate.parameters():
-            p.requires_grad_(False)
+    gate = None
+    if not args.no_gate:
+        # ── Gate ──────────────────────────────────────────────────────────────────
+        n_heads = model.config.num_attention_heads
+        # The gate layer may be ANY layer (run-17: gate at a DeltaNet layer is a
+        # deliberate variant — the a_j split dispatches to linear_attn in
+        # _attn_only_forward_eager, and the gate branch clones the layer's MLP,
+        # which every hybrid layer has). Bias still lands only on the FULL-attn
+        # layers above L; a DeltaNet gate layer simply contributes scoring, not a
+        # biased mixer. Print the layout so the config is visible in the log.
+        _full_attn_indices = get_full_attn_layer_indices(model)
+        if args.gate_layer >= len(model.model.layers) - 1:
+            raise ValueError(f"gate_layer={args.gate_layer} leaves no Phase-2 layers")
+        if is_main and args.gate_layer not in _full_attn_indices:
+            print(f"[train] gate_layer={args.gate_layer} is a LINEAR-ATTENTION "
+                  f"(DeltaNet) layer — scoring reads its hidden state; bias applies "
+                  f"to full-attn layers {[i for i in _full_attn_indices if i > args.gate_layer]}")
+        # n_layers_bias: number of Phase-2 layers that receive the gate bias.
+        # For Qwen3.5 hybrid only the FULL-attention layers strictly above the gate
+        # layer are biased (linear-attn/DeltaNet layers carry no per-token KV bias in
+        # the current baseline). For homogeneous Qwen3 this equals num_layers-L-1.
+        _full_attn_above_L = [i for i in _full_attn_indices if i > args.gate_layer]
+        n_layers_bias = len(_full_attn_above_L)
+        gate = E2EGate(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_layers_bias=n_layers_bias,
+            selection_mode=args.gate_selection,
+            tau=args.tau,
+        ).to(device).to(torch.float32)
         if is_main:
-            print(f"[train] --random-topk: gate FROZEN ({sum(p.numel() for p in gate.parameters())/1e6:.2f}M "
-                  f"params, requires_grad=False), top-K replaced by uniform random K-subset.")
-    if is_main:
-        print(f"[train] Gate: n_heads={n_heads}, "
-              f"n_layers_bias={n_layers_bias}, "
-              f"selection={args.gate_selection}, tau={args.tau}, sparsity_lambda={args.sparsity_lambda}, "
-              f"sparsity_mode={args.sparsity_mode}, sparsity_sharpness={args.sparsity_sharpness}")
-    if args.resume_gate:
-        gate, meta = load_gate(args.resume_gate)
-        gate = gate.to(device).to(torch.float32)
+            import hashlib
+            with open(os.path.join(args.output_dir, "params.json"), "rb") as params_file:
+                params_bytes = params_file.read()
+            gate.training_provenance = {
+                "run_id": json.loads(params_bytes)["run_id"],
+                "params_sha256": hashlib.sha256(params_bytes).hexdigest(),
+            }
+        # Dedicated SCORING branch (--gate-branch): unties the token-ranking readout from
+        # the hidden state that gets FORWARDED to layer gate_layer+1. Hypothesis: the layer-0
+        # delta adapter is weight-tied across two incompatible jobs. The forward path is
+        # UNCHANGED (delta-adapted layer 0, Phase-2 biases, learnable gate_scale/attn_scale);
+        # only the gate projection's input changes. Built from the CURRENT layer weights, so
+        # at init h_gate == h_fwd and the model is byte-identical to the tied architecture.
+        # Attached to `gate` so gate_parameters (optimizer + _sync_params + SWA) covers it.
+        # gate_scale init: beta = softplus^-1(s_l) from the pretrained qk-norm gains
+        # (set_qk_norm_scales) — the bias starts at ~one native logit-sigma per layer.
+        _qk_s_l_vals = gate.set_qk_norm_scales(model, args.gate_layer)
+        if rank == 0:
+            print(f"[train] gate_scale init: s_l = ||g_q (.) g_k||_2/sqrt(d) per phase-2 layer "
+                  f"(min={min(_qk_s_l_vals):.3f} mean={sum(_qk_s_l_vals)/len(_qk_s_l_vals):.3f} "
+                  f"max={max(_qk_s_l_vals):.3f}); gate_scale LEARNABLE softplus(beta), "
+                  f"init softplus^-1(s_l); temperature: s_eff = r * softplus(sigma), init 1; "
+                  f"b_norm gain FROZEN at {float(gate.b_norm.weight.item()):.2f}",
+                  flush=True)
+        if rank == 0 and args.wandb_project:
+            import wandb as _wandb_slog
+            _sl_log = {f"train/s_l/layer{args.gate_layer + 1 + _i}": _v
+                       for _i, _v in enumerate(_qk_s_l_vals)}
+            _sl_log["train/s_l_mean"] = sum(_qk_s_l_vals) / len(_qk_s_l_vals)
+            _sl_log["train/s_l_min"] = min(_qk_s_l_vals)
+            _sl_log["train/s_l_max"] = max(_qk_s_l_vals)
+            _wandb_slog.log(_sl_log, step=0)
+
+
+        from tokengate.e2e_gate.gate_module.gate_forward import build_gate_branch
+        _br = build_gate_branch(model, gate, args.gate_layer).to(device)
         if is_main:
-            print(f"[train] Resumed gate from {args.resume_gate}")
+            print(f"[train] GATE BRANCH: dedicated scoring branch "
+                  f"init from layer {args.gate_layer} "
+                  f"({sum(p.numel() for p in _br.parameters()) / 1e6:.2f}M trainable, "
+                  f"fp32 storage, compute in the backbone dtype). "
+                  "Split active: Phase 1 ends at a_j; the layer's own MLP runs "
+                  "on kept tokens in Phase 2.")
+
+        # Plumb the sparsity-penalty config onto the gate object so
+        # gate_forward._accumulate_gate_sparsity can read it on each forward.
+        # (E2EGate's __init__ doesn't accept these — they're train-time-only.)
+        gate.sparsity_mode = args.sparsity_mode
+        gate.sparsity_sharpness = float(args.sparsity_sharpness)
+        # --random-topk: replace gate top-K with a uniform random K-subset of article
+        # tokens (see gate_forward._select_topk_or_random).  Freeze all gate params so
+        # the gate stays at zero-init throughout (b=0 → no Phase 2 attention bias);
+        # the gate runs forward but its output is functionally a no-op besides
+        # selecting K positions at random.
+        gate.random_topk = bool(args.random_topk)
+        if gate.random_topk:
+            for p in gate.parameters():
+                p.requires_grad_(False)
+            if is_main:
+                print(f"[train] --random-topk: gate FROZEN ({sum(p.numel() for p in gate.parameters())/1e6:.2f}M "
+                      f"params, requires_grad=False), top-K replaced by uniform random K-subset.")
+        if is_main:
+            print(f"[train] Gate: n_heads={n_heads}, "
+                  f"n_layers_bias={n_layers_bias}, "
+                  f"selection={args.gate_selection}, tau={args.tau}, sparsity_lambda={args.sparsity_lambda}, "
+                  f"sparsity_mode={args.sparsity_mode}, sparsity_sharpness={args.sparsity_sharpness}")
+        if args.resume_gate:
+            gate, meta = load_gate(args.resume_gate)
+            gate = gate.to(device).to(torch.float32)
+            if is_main:
+                print(f"[train] Resumed gate from {args.resume_gate}")
+    gate_parameters = list(gate.parameters()) if gate is not None else []
+    gate_named_parameters = list(gate.named_parameters()) if gate is not None else []
+    parameters = trainable_parameters(model, gate)
+    if resume_state is not None:
+        if set(resume_state["parameters"]) != set(parameters):
+            raise ValueError("Resume checkpoint parameters differ")
+        with torch.no_grad():
+            for name, parameter in parameters.items():
+                parameter.copy_(resume_state["parameters"][name])
+    elif strict and protocol.get("smoke") and is_main:
+        atomic_save({name: p.detach().cpu() for name, p in parameters.items()},
+                    output / "initial_parameters.pt")
     if _resume_state is not None:
         # Restore gate + LoRA + full-FT backbone weights from sibling
         # *_step{N}.pt files written by the same periodic checkpoint.
-        _gate_ckpt_path = os.path.join(
-            _resume_dir, f"gate_step{_resume_step_file_step}.pt"
-        )
-        # Strict-load the RAW saved state dict into the live gate (which already
-        # has the scoring branch attached). load_state_dict copies values into
-        # the existing fp32 params (a pre-fp32-storage checkpoint's bf16 branch
-        # weights upcast exactly); the branch computes in the backbone dtype
-        # regardless of its param dtype (CastLinear).
-        _gate_obj = torch.load(_gate_ckpt_path, map_location="cpu", weights_only=False)
-        gate.load_state_dict(_gate_obj["state_dict"])
-        del _gate_obj
-        gate = gate.to(device)
-        if is_main:
-            print(f"[train] Restored gate weights from {_gate_ckpt_path}")
+        if gate is not None:
+            _gate_ckpt_path = os.path.join(
+                _resume_dir, f"gate_step{_resume_step_file_step}.pt"
+            )
+            # Strict-load the RAW saved state dict into the live gate (which already
+            # has the scoring branch attached). load_state_dict copies values into
+            # the existing fp32 params (a pre-fp32-storage checkpoint's bf16 branch
+            # weights upcast exactly); the branch computes in the backbone dtype
+            # regardless of its param dtype (CastLinear).
+            _gate_obj = torch.load(_gate_ckpt_path, map_location="cpu", weights_only=False)
+            gate.load_state_dict(_gate_obj["state_dict"])
+            del _gate_obj
+            gate = gate.to(device)
+            if is_main:
+                print(f"[train] Restored gate weights from {_gate_ckpt_path}")
         if _lora_enabled:
             _lora_ckpt_path = os.path.join(
                 _resume_dir, f"lora_step{_resume_step_file_step}.pt"
@@ -2216,8 +2237,8 @@ def train(args):
         # frozen b_norm gain) must not be reported as trainable. The sftbase
         # banner printed "trainable=12.26M (gate=4.59M)" for a FROZEN gate
         # before this fix.
-        n_gate = sum(p.numel() for p in gate.parameters() if p.requires_grad)
-        n_gate_frozen = sum(p.numel() for p in gate.parameters() if not p.requires_grad)
+        n_gate = sum(p.numel() for p in gate_parameters if p.requires_grad)
+        n_gate_frozen = sum(p.numel() for p in gate_parameters if not p.requires_grad)
         n_backbone_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         n_backbone_total = sum(p.numel() for p in model.parameters())
         n_trainable = n_gate + n_backbone_trainable
@@ -2236,7 +2257,7 @@ def train(args):
     # backbone is handled.
     if world_size > 1:
         # Synchronise initial gate weights so all ranks start from the same point.
-        for p in gate.parameters():
+        for p in gate_parameters:
             dist.broadcast(p.data, src=0)
         # Synchronise LoRA weights (rank 0 may have loaded a resume checkpoint).
         for p in lora_params:
@@ -2263,7 +2284,8 @@ def train(args):
     # Every trainable gate param is fp32 storage (the scoring branch computes in its
     # compute dtype through CastLinear).  The optimizer update and the SWA running
     # mean both rely on this; fail here rather than train a silently-quantised param.
-    assert_fp32_params(gate, "gate (incl. scoring branch)")
+    if gate is not None:
+        assert_fp32_params(gate, "gate (incl. scoring branch)")
 
     _scalar_param_names = {"attn_scale", "v_attn", "log_temp_ca"}
     # --scalar-lr-include-gate-scale: explicit opt-in (run-4 experiment). The
@@ -2273,7 +2295,7 @@ def train(args):
     if getattr(args, "scalar_lr_include_gate_scale", False):
         _scalar_param_names = _scalar_param_names | {"gate_scale"}
     _scalar_params = [
-        p for n, p in gate.named_parameters()
+        p for n, p in gate_named_parameters
         if n in _scalar_param_names and p is not None
     ]
     # requires_grad filter: frozen gate params (the b_norm gain, the whole gate
@@ -2281,7 +2303,7 @@ def train(args):
     # them as live and waste optimizer state on them, and param-count prints
     # would overcount.
     _main_gate_params = [
-        p for n, p in gate.named_parameters()
+        p for n, p in gate_named_parameters
         if n not in _scalar_param_names and p.requires_grad
     ]
     _scalar_params = [p for p in _scalar_params if p.requires_grad]
@@ -2299,7 +2321,7 @@ def train(args):
     _adamw_wd = args.weight_decay if args.weight_decay is not None else 1e-4
     _muon_wd = args.weight_decay if args.weight_decay is not None else 0.0
     _opt_kwargs = {"weight_decay": _adamw_wd}
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not strict:
         try:
             torch.optim.AdamW([torch.zeros(1, device="cuda")], fused=True)
             _opt_kwargs["fused"] = True
@@ -2318,7 +2340,7 @@ def train(args):
         # DECAYED before this fix (ndim==2 passed the old test) despite the
         # run scripts documenting it as wd-exempt -- a shrink prior on the
         # exact parameter whose growth bottlenecks the bias.
-        _nd_ids = {id(p) for n, p in gate.named_parameters()
+        _nd_ids = {id(p) for n, p in gate_named_parameters
                    if n in _no_decay_names or p.ndim < 2 or min(p.shape) == 1}
         _main_decay = [p for p in _main_gate_params if id(p) not in _nd_ids]
         _main_nodecay = [p for p in _main_gate_params if id(p) in _nd_ids]
@@ -2336,11 +2358,11 @@ def train(args):
             _sg["weight_decay"] = 0.0
         _opt_groups.append(_sg)
         if is_main:
-            print(f"[train] Scalar params ({[n for n, p in gate.named_parameters() if n in _scalar_param_names]}) "
+            print(f"[train] Scalar params ({[n for n, p in gate_named_parameters if n in _scalar_param_names]}) "
                   f"using lr={_scalar_lr:.2e} ({args.scalar_lr_mult}× base lr={args.lr:.2e})")
     if getattr(args, "no_decay_scalars", False) and is_main:
         print(f"[train] No weight decay on "
-              f"{[n for n, p in gate.named_parameters() if id(p) in _nd_ids]}")
+              f"{[n for n, p in gate_named_parameters if id(p) in _nd_ids]}")
     if lora_params:
         # foreach=False on LoRA group: see opt_kwargs comment above.
         # Cannot use fused with mixed-precision LoRA params unless they're fp32;
@@ -2350,7 +2372,7 @@ def train(args):
             print(f"[train] Adapter ({_adapter_type}) params: lr={_lora_lr:.2e}")
     if is_main:
         _wd_eff = (_muon_wd if getattr(args, "optimizer", "adamw") == "muon" else _adamw_wd)
-        _br_ids = {id(p) for p in gate.gate_branch.parameters()}
+        _br_ids = {id(p) for p in gate.gate_branch.parameters()} if gate is not None else set()
         if _wd_eff > 0 and any(id(p) in _br_ids for p in _main_decay):
             print(f"[train] WARNING: weight_decay={_wd_eff} applies to the scoring branch "
                   f"(fp32 storage; initialised from the pretrained layer-{args.gate_layer} "
@@ -2385,7 +2407,7 @@ def train(args):
         # (1, d) readout stay on AdamW — orthogonalising them is meaningless.
         _adamw_ids = {id(p) for p in _scalar_params}
         if getattr(args, "muon_gate", False):
-            _adamw_ids |= {id(p) for n, p in gate.named_parameters()
+            _adamw_ids |= {id(p) for n, p in gate_named_parameters
                            if n in _no_decay_names or p.ndim != 2 or min(p.shape) == 1}
         else:
             _adamw_ids |= {id(p) for p in _main_gate_params}
@@ -2410,8 +2432,12 @@ def train(args):
                   f"on {_n_muon/1e6:.2f}M matrix params "
                   f"+ aux-AdamW on {_n_aux/1e6:.2f}M params")
     else:
+        if strict:
+            _opt_kwargs.update(betas=(0.9, 0.95), foreach=False)
         optimizer = torch.optim.AdamW(_opt_groups, **_opt_kwargs)
 
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
     if _resume_state is not None:
         optimizer.load_state_dict(_resume_state["optimizer_state"])
         if is_main:
@@ -2458,7 +2484,7 @@ def train(args):
     # eval forward calls so we can compute pct_above_tau without polluting train.
     _gate_capture = [False]
     _gate_eval_capture = [False]
-    _gate_hook_handle = _gate_raw_for_hook.register_forward_hook(_gate_output_hook)
+    _gate_hook_handle = (gate.register_forward_hook(_gate_output_hook) if gate is not None else None)
 
     # ── Build SFT dataset ─────────────────────────────────────────────────────
     # Parse --dataset / --task into aligned lists.  Single-dataset case: list of len 1.
@@ -2542,7 +2568,7 @@ def train(args):
     # pool (v3: ~314GB unpickled) on 8 ranks peaks at ~2.5TB during the load →
     # OOM.  _n_train_global accumulates the pre-shard global count so the step
     # estimate stays "one epoch = one pass over the full pool across ranks".
-    _shard_at_load = (getattr(args, "shuffle_epochs", False) and world_size > 1)
+    _shard_at_load = (getattr(args, "shuffle_epochs", False) and world_size > 1 and not strict)
     _n_train_global = 0
     # Per project policy we NEVER truncate a sample: a row whose prunable article
     # is outside [MIN_ARTICLE_TOKENS, MAX_ARTICLE_TOKENS] is DROPPED, not
@@ -3156,7 +3182,6 @@ def train(args):
                 _wandb_run.summary[f"data/{_ds}/n_eval_samples"] = len(_samps)
 
     # ── Resolve steps from epochs (if --epochs was given) ────────────────────
-    import math
     if args.epochs is not None:
         effective_batch = args.batch_size * world_size
         # Use the GLOBAL (pre-shard) train size: under DDP data sharding each
@@ -3167,6 +3192,9 @@ def train(args):
             print(f"[train] --epochs {args.epochs} → {args.steps} steps "
                   f"({_n_train_global} global samples, eff. batch {effective_batch})")
 
+    max_steps = args.steps
+    if strict and _n_train_global != 12000:
+        raise ValueError(f"Expected the complete 12,000-row pool; loaded {_n_train_global}")
     warmup_steps = min(args.warmup_steps, args.steps)
     use_constant_lr = args.lr_schedule == "constant"
     if warmup_steps > 0:
@@ -3222,6 +3250,10 @@ def train(args):
             print(f"[train] Restored LR scheduler position {_saved_epoch} (group lrs: "
                   f"{', '.join(f'{x:.2e}' for x in _last_lrs)})")
 
+    if resume_state is not None:
+        scheduler.load_state_dict(resume_state["scheduler"])
+        optimizer.load_state_dict(resume_state["optimizer"])
+
     # ── SWA setup ─────────────────────────────────────────────────────────────
     # NOTE: intentionally NOT gated on is_main so that all ranks enter the SWA
     # block and hit the dist.barrier() calls inside it.  Rank 0's eval at SWA
@@ -3260,16 +3292,28 @@ def train(args):
     # master cost a full D2H copy of the adapter plus a CPU running-mean pass every step
     # (~0.1-0.2 s/step for a 109M-param delta, 3-6% of the step) on every rank.
     swa_adapter_sd: Optional[Dict[str, torch.Tensor]] = None
+    if resume_state is not None and resume_state["average_count"]:
+        average = resume_state["average"]
+        swa_n = resume_state["average_count"]
+        if gate is not None:
+            swa_gate = copy.deepcopy(gate).eval()
+            with torch.no_grad():
+                for name, parameter in swa_gate.named_parameters():
+                    if parameter.requires_grad:
+                        parameter.copy_(average["gate." + name])
+        swa_adapter_sd = {name: average["adapter." + name].to(device).clone()
+                          for name, parameter in collect_lora_named_params(model)}
     if _resume_state is not None and _resume_state.get("swa_n", 0) > 0:
         # Materialize swa_gate as a deep copy of the (just-restored) gate, then
         # overlay the saved SWA-averaged weights.  fp32 storage like the live gate
         # (asserted: the running mean is exact only in fp32; a pre-fp32-storage
         # train_state's bf16 average loads upcast and averaging continues from
         # whatever it holds).  Materialized on every rank, like the cold-start path.
-        swa_gate = copy.deepcopy(gate)
-        assert_fp32_params(swa_gate, "swa_gate (resume)")
-        swa_gate.load_state_dict(_resume_state["swa_gate_state"])
-        swa_gate.eval()
+        if gate is not None:
+            swa_gate = copy.deepcopy(gate)
+            assert_fp32_params(swa_gate, "swa_gate (resume)")
+            swa_gate.load_state_dict(_resume_state["swa_gate_state"])
+            swa_gate.eval()
         swa_n = int(_resume_state["swa_n"])
         if _lora_enabled and _resume_state.get("swa_adapter_state") is not None:
             # train_state stores CPU copies; the running average lives on the device
@@ -3557,9 +3601,9 @@ def train(args):
                 _counts = _floor + (_rng_np.random(_n)
                                     < (_packed_keep_prob - _floor)).astype(np.int64)
                 _perm = np.repeat(np.arange(_n), _counts)
+                _rng_np.shuffle(_perm)
             else:
-                _perm = np.arange(_n)
-            _rng_np.shuffle(_perm)
+                _perm = epoch_order(_n, args.seed, _epoch_state["epoch"])
             _perm = _perm if _data_presharded else _perm[rank::world_size]
         else:
             _g = random.Random(_seed)
@@ -3604,6 +3648,12 @@ def train(args):
         return rng.choice(tokenized_train)
 
     step = 0
+    if resume_state is not None:
+        step = resume_state["step"]
+        epoch, cursor = divmod(step * args.batch_size, len(tokenized_train) // world_size)
+        _epoch_state["epoch"] = epoch - 1
+        _refill_epoch_order()
+        _epoch_state["cursor"] = cursor
     if _resume_state is not None:
         step = int(_resume_state["step"])
         if is_main:
@@ -3637,13 +3687,14 @@ def train(args):
     _saved_branch_grad_norms: dict = {}
     _last_batch_data: list = []  # updated each step; used for SWA train-loss spot-check
     model.eval()  # backbone in eval mode throughout (no dropout)
-    gate.train()
+    if gate is not None: gate.train()
     optimizer.zero_grad(set_to_none=True)
 
     pbar = tqdm(total=args.steps, desc=f"train[r{rank}]") if is_main else None
     if pbar is not None and step > 0:
         pbar.update(step)
     t0 = time.time()
+    started = time.monotonic()
     # Profiling: wall-clock of the previous completed UPDATE step.  dt between
     # consecutive successful updates = steady-state s/it (the [profile] line is
     # emitted after `step += 1` in the success path; eval/ckpt/SWA are no-ops
@@ -3692,7 +3743,7 @@ def train(args):
     else:
         # phase2_loguniform (validated at startup): sampled L + full sentinel.
         _mixed_k_m_cfg = 2
-    use_batching = batch_size > 1 or _mixed_k_m_cfg > 1
+    use_batching = args.no_gate or batch_size > 1 or _mixed_k_m_cfg > 1
     if not use_batching:
         # The legacy single-sample training path was REMOVED (cleanup after the a_j
         # split landed): it predated the scoring branch and would silently score from
@@ -3725,7 +3776,7 @@ def train(args):
                   f"eval; restored {len(_no_compress_per_group)} no-compress "
                   f"groups from checkpoint.")
 
-    if eval_samples and _resume_state is None and not args.profile:
+    if eval_samples and _resume_state is None and not args.profile and not strict:
         for _grp, _samps in eval_samples_by_group.items():
             if not _samps:
                 continue
@@ -3762,69 +3813,72 @@ def train(args):
     # ── Patch model with FlexAttention ───────────────────────────────────────
     # Done AFTER the no-compression baseline evals so they run on the model's
     # native SDPA attention — simpler, deterministic, no FlexAttention overhead.
-    print("[train] Patching model with FlexAttention...")
-    model = patch_model_with_flex_attention(model)
-    print("[train] Model patched successfully")
-    warmup_flex_attention(device)
-    if args.attn_backends != "flex":
-        set_attention_backends_for_layers(model, args.attn_backends)
-        if is_main:
-            print(f"[train] attention kernels: {args.attn_backends} -> causal/bias = {GATE_ATTN[args.attn_backends]}")
+    if gate is not None:
+        print("[train] Patching model with FlexAttention...")
+        model = patch_model_with_flex_attention(model)
+        print("[train] Model patched successfully")
+        warmup_flex_attention(device)
+        if args.attn_backends != "flex":
+            set_attention_backends_for_layers(model, args.attn_backends)
+            if is_main:
+                print(f"[train] attention kernels: {args.attn_backends} -> causal/bias = {GATE_ATTN[args.attn_backends]}")
 
-    # ── Optionally compile phase-2 transformer layers ────────────────────────
-    # `--compile-phase2` wraps each transformer layer ABOVE the gate layer with
-    # torch.compile.  FlexAttention itself is already compiled (dynamic=True,
-    # fullgraph=False) inside each attention forward, so this nests another
-    # compile boundary around the layer (q/k/v_proj → attn → o_proj → MLP).
-    # The expected win is 10-30 % on the phase-2 forward (the MLP + norm +
-    # residual + projection portion that's NOT inside FlexAttention).
-    #
-    # Risks:
-    #   - First step after enabling will see a one-shot 10-60 s compile burst
-    #     per unique seq-len bucket (dynamic=True should bound this).
-    #   - With FlexAttention nested, recompiles can stack — we already bumped
-    #     `_dynamo.config.recompile_limit = 64`.  May need to bump higher.
-    #   - Per-layer compile interacts with LoRA: if LoRA is applied AFTER
-    #     compile, the compiled graph captures the pre-LoRA module.  We thus
-    #     compile AFTER LoRA injection (which happens in patch_model_for_lora
-    #     called later) — see below for the correct ordering.
-    # Default off until 8-GPU integration testing validates correctness.
-    if args.pack_phase2_max_tokens > 0:
-        if args.attn_backends != "fa2":
-            raise ValueError(f"--pack-phase2-max-tokens needs --attn-backends fa2, got {args.attn_backends!r}")
-        if args.batch_size != 1:
-            raise ValueError(f"--pack-phase2-max-tokens needs batch size 1, got {args.batch_size}")
-        from kernels.fa2bias.keybias import require_varlen
-        require_varlen()
-        _gate_forward_mod.PACK_PHASE2 = True
+        # ── Optionally compile phase-2 transformer layers ────────────────────────
+        # `--compile-phase2` wraps each transformer layer ABOVE the gate layer with
+        # torch.compile.  FlexAttention itself is already compiled (dynamic=True,
+        # fullgraph=False) inside each attention forward, so this nests another
+        # compile boundary around the layer (q/k/v_proj → attn → o_proj → MLP).
+        # The expected win is 10-30 % on the phase-2 forward (the MLP + norm +
+        # residual + projection portion that's NOT inside FlexAttention).
+        #
+        # Risks:
+        #   - First step after enabling will see a one-shot 10-60 s compile burst
+        #     per unique seq-len bucket (dynamic=True should bound this).
+        #   - With FlexAttention nested, recompiles can stack — we already bumped
+        #     `_dynamo.config.recompile_limit = 64`.  May need to bump higher.
+        #   - Per-layer compile interacts with LoRA: if LoRA is applied AFTER
+        #     compile, the compiled graph captures the pre-LoRA module.  We thus
+        #     compile AFTER LoRA injection (which happens in patch_model_for_lora
+        #     called later) — see below for the correct ordering.
+        # Default off until 8-GPU integration testing validates correctness.
+        _gate_forward_mod.PACK_PHASE2 = args.pack_phase2_max_tokens > 0
         _gate_forward_mod.PACK_PHASE2_MAX_TOKENS = args.pack_phase2_max_tokens
-    if is_main:
-        print(f"[train] packed Phase 2: {'<= ' + str(args.pack_phase2_max_tokens) + ' tokens' if args.pack_phase2_max_tokens > 0 else 'off'}")
-    _compile_phase2 = bool(getattr(args, "compile_phase2", False))
-    if _compile_phase2:
+        if args.pack_phase2_max_tokens > 0:
+            if args.attn_backends != "fa2":
+                raise ValueError(f"--pack-phase2-max-tokens needs --attn-backends fa2, got {args.attn_backends!r}")
+            if args.batch_size != 1:
+                raise ValueError(f"--pack-phase2-max-tokens needs batch size 1, got {args.batch_size}")
+            from kernels.fa2bias.keybias import require_varlen
+            require_varlen()
+            _gate_forward_mod.PACK_PHASE2 = True
+            _gate_forward_mod.PACK_PHASE2_MAX_TOKENS = args.pack_phase2_max_tokens
         if is_main:
-            print(f"[train] --compile-phase2 enabled: will compile transformer "
-                  f"layers [{args.gate_layer + 1}..{len(model.model.layers)-1}] "
-                  f"AFTER LoRA injection.  Expect a one-time compile burst on "
-                  f"the first eval / training step at each unique seq-len bucket.")
-        # Bump recompile limit for safety: with N length buckets × FlexAttention
-        # already using up to ~8 recompile slots, the default 64 can be tight.
-        try:
-            torch._dynamo.config.recompile_limit = max(
-                getattr(torch._dynamo.config, "recompile_limit", 8), 256
-            )
-        except Exception:
-            pass
-        # nn.Module.compile: in place, no OptimizedModule wrapper, so parameter names -- and
-        # with them every saved adapter key -- stay as uncompiled.  `dynamic=True` avoids
-        # per-seq-len recompiles; `fullgraph=False` allows graph breaks inside the layer.
-        _phase2_start = args.gate_layer + 1
-        _phase2_end = len(model.model.layers)
-        for _li in range(_phase2_start, _phase2_end):
-            model.model.layers[_li].compile(dynamic=True, fullgraph=False)
-        if is_main:
-            print(f"[train]   compiled layers {_phase2_start}..{_phase2_end-1} "
-                  f"(N={_phase2_end - _phase2_start}); first step will compile.")
+            print(f"[train] packed Phase 2: {'<= ' + str(args.pack_phase2_max_tokens) + ' tokens' if args.pack_phase2_max_tokens > 0 else 'off'}")
+        _compile_phase2 = bool(getattr(args, "compile_phase2", False))
+        if _compile_phase2:
+            if is_main:
+                print(f"[train] --compile-phase2 enabled: will compile transformer "
+                      f"layers [{args.gate_layer + 1}..{len(model.model.layers)-1}] "
+                      f"AFTER LoRA injection.  Expect a one-time compile burst on "
+                      f"the first eval / training step at each unique seq-len bucket.")
+            # Bump recompile limit for safety: with N length buckets × FlexAttention
+            # already using up to ~8 recompile slots, the default 64 can be tight.
+            try:
+                torch._dynamo.config.recompile_limit = max(
+                    getattr(torch._dynamo.config, "recompile_limit", 8), 256
+                )
+            except Exception:
+                pass
+            # nn.Module.compile: in place, no OptimizedModule wrapper, so parameter names -- and
+            # with them every saved adapter key -- stay as uncompiled.  `dynamic=True` avoids
+            # per-seq-len recompiles; `fullgraph=False` allows graph breaks inside the layer.
+            _phase2_start = args.gate_layer + 1
+            _phase2_end = len(model.model.layers)
+            for _li in range(_phase2_start, _phase2_end):
+                model.model.layers[_li].compile(dynamic=True, fullgraph=False)
+            if is_main:
+                print(f"[train]   compiled layers {_phase2_start}..{_phase2_end-1} "
+                      f"(N={_phase2_end - _phase2_start}); first step will compile.")
     def _add_baselines(d: dict) -> dict:
         """Inject stored baseline metrics as flat W&B lines.
 
@@ -3909,12 +3963,12 @@ def train(args):
     # step, not step 0: W&B dedupes a re-logged step 0, and overwriting the original
     # init point with a now-trained curve would be worse than not logging at all.
     _init_eval_step = 0 if _resume_state is None else int(_start_step)
-    if (eval_samples and not args.profile
+    if (eval_samples and not args.profile and not strict
             and (_resume_state is None or args.eval_on_resume)):
         if world_size > 1:
             dist.barrier()
         torch.cuda.empty_cache()
-        gate.eval()
+        if gate is not None: gate.eval()
         if is_main:
             eval_steps.append(_init_eval_step)
             _wandb_log = {}
@@ -3964,7 +4018,7 @@ def train(args):
             # ── random-K baseline at the INIT point too, so the eval/randomk_* curve
             #    starts at step 0 alongside the gated curve (same construction as the
             #    periodic block: random selection, no bias, no attn_scale, all-rank DDP). ──
-            for _rk_gatemode in (True,):  # random-K on the gate model (always on)
+            for _rk_gatemode in ((True,) if gate is not None else ()):  # random-K on the gate model (always on)
                 _gi = gate.module if hasattr(gate, "module") else gate
                 _prev_rt = getattr(_gi, "random_topk", False)
                 _prev_nb = getattr(_gi, "_baseline_no_bias_scale", False)
@@ -4033,7 +4087,7 @@ def train(args):
             _gate_output_eval_buf.clear()
             if _wandb_run is not None:
                 _wandb_run.log(_add_baselines(_wandb_log), step=_init_eval_step)
-        gate.train()
+        if gate is not None: gate.train()
         if world_size > 1:
             dist.barrier()
 
@@ -4055,6 +4109,34 @@ def train(args):
               f"allocated={torch.cuda.memory_allocated()/1e9:.1f}GB "
               f"reserved={torch.cuda.memory_reserved()/1e9:.1f}GB", flush=True)
 
+    def _average_parameters():
+        if not swa_n:
+            return {}
+        result = {"adapter." + name: value for name, value in swa_adapter_sd.items()}
+        if swa_gate is not None:
+            result.update({"gate." + name: parameter for name, parameter in swa_gate.named_parameters()
+                           if parameter.requires_grad})
+        return result
+
+    def _save_protocol_state():
+        states = [None] * world_size
+        if world_size > 1:
+            dist.all_gather_object(states, rng_state(), group=_OBJ_PG)
+        else:
+            states[0] = rng_state()
+        if is_main:
+            atomic_json(selection.state_dict(), output / "selection.json")
+            atomic_save(dict(
+                config=protocol, step=step, optimizer=optimizer.state_dict(),
+                scheduler=scheduler.state_dict(),
+                parameters={name: p.detach().cpu() for name, p in parameters.items()},
+                average={name: p.detach().cpu() for name, p in _average_parameters().items()},
+                average_count=swa_n, selection=selection.state_dict(), rng_by_rank=states,
+                elapsed_seconds=prior_seconds + time.monotonic() - started,
+            ), output / "train_state.pt")
+        if world_size > 1:
+            dist.barrier()
+
     def _do_checkpoint_save(_step):
         """Save gate / LoRA / FT-below weights + train_state at _step.
 
@@ -4065,6 +4147,9 @@ def train(args):
         that no rank OOMs in any given iteration is ~0.61), which produces
         runs that complete without a single intermediate step checkpoint.
         """
+        if strict:
+            _save_protocol_state()
+            return
         if args.profile:          # throughput-only run: no checkpoint I/O
             return
         if not is_main:
@@ -4086,7 +4171,8 @@ def train(args):
             "lora_start_layer": lora_start_layer if _lora_enabled else None,
         }
         ckpt_path = os.path.join(args.output_dir, f"gate_step{_step}.pt")
-        save_gate(gate, ckpt_path, metadata=_ckpt_meta)
+        if gate is not None:
+            save_gate(gate, ckpt_path, metadata=_ckpt_meta)
         _extra_saved = []
         if _lora_enabled:
             lora_ckpt_path = os.path.join(args.output_dir, f"lora_step{_step}.pt")
@@ -4097,10 +4183,11 @@ def train(args):
         # benchmarked directly without extracting swa_* from train_state. Follows
         # the same keep_last/keep_best retention as the raw step checkpoints.
         if (getattr(args, "save_swa_step_checkpoints", False)
-                and swa_gate is not None and swa_n > 0):
-            swa_gate_path = os.path.join(args.output_dir, f"swa_gate_step{_step}.pt")
-            save_gate(swa_gate, swa_gate_path, metadata={**_ckpt_meta, "swa": True, "swa_n": swa_n})
-            _extra_saved.append(swa_gate_path)
+                and swa_n > 0):
+            if swa_gate is not None:
+                swa_gate_path = os.path.join(args.output_dir, f"swa_gate_step{_step}.pt")
+                save_gate(swa_gate, swa_gate_path, metadata={**_ckpt_meta, "swa": True, "swa_n": swa_n})
+                _extra_saved.append(swa_gate_path)
             if _lora_enabled and swa_adapter_sd is not None:
                 swa_lora_path = os.path.join(args.output_dir, f"swa_lora_step{_step}.pt")
                 torch.save({k: v.detach().cpu() for k, v in swa_adapter_sd.items()},
@@ -4146,6 +4233,33 @@ def train(args):
         the enclosing scope; the only rebound int (_swa_eval_cycle) is declared
         nonlocal so its `+= 1` increment hits the outer scope.
         """
+        nonlocal _stop_requested
+        if strict:
+            directory = Path(args.pretrain_data_root) / args.dataset / args.task / "tokenized" / model_name
+            rows = validation_rows(directory, Path(args.eval_split_manifest))
+            if protocol.get("smoke"):
+                rows = rows[:world_size]
+            average = _average_parameters()
+            for variant in (["raw", "swa"] if average else ["raw"]):
+                with averaged_parameters(parameters, average if variant == "swa" else parameters):
+                    for budget in ([2000, None] if gate is not None else [None]):
+                        metrics = evaluate_reproduction(
+                            model, gate, tokenizer, rows, protocol, budget=budget, step=step,
+                            variant=variant, rank=rank, world_size=world_size,
+                            output=output / "validation",
+                        )
+                        if budget == 2000 or gate is None:
+                            selection.consider(step, variant, metrics["accuracy"], metrics["loss"])
+                        if is_main:
+                            result = dict(step=step, variant=variant, budget=budget, **metrics,
+                                          elapsed_seconds=prior_seconds + time.monotonic() - started)
+                            with (output / "validation.jsonl").open("a") as stream:
+                                stream.write(json.dumps(result, allow_nan=False) + "\n")
+                    if is_main:
+                        save_weights(model, gate, protocol, step=step, variant=variant,
+                                     adapter_layers=lora_layer_ids, destination=output / "checkpoints")
+            _stop_requested = selection.finish_cycle(step)
+            return
         nonlocal _swa_eval_cycle
         # Throughput-only run: skip eval entirely.  Guarded identically on every
         # rank (the call sites are deterministic `step % eval_freq == 0`), so all
@@ -4162,7 +4276,7 @@ def train(args):
             print(f"[eval-mem] rank={rank} step={step} entering eval: "
                   f"allocated={torch.cuda.memory_allocated()/2**30:.1f}GB "
                   f"reserved={torch.cuda.memory_reserved()/2**30:.1f}GB", flush=True)
-            gate.eval()
+            if gate is not None: gate.eval()
             if is_main:
                 eval_steps.append(step)
                 _wandb_log = {"eval/epoch": step * (args.batch_size * world_size) / _n_train_global}
@@ -4233,7 +4347,7 @@ def train(args):
                 # ── random-K checkpoint baseline (benchmark `randomk` analogue): SAME
                 #    adapter+gate model, random token selection instead of gate top-K
                 #    (gate.random_topk). Collective eval on all ranks. ──────────────
-                for _rk_gatemode in (True,):  # random-K on the gate model (always on)
+                for _rk_gatemode in ((True,) if gate is not None else ()):  # random-K on the gate model (always on)
                     # _rk_gatemode False → benchmark-matched base randomk (no bias, no
                     # scale); True → random selection on the GATE model (temperature
                     # and live bias kept) under eval/randomkgate_*.
@@ -4261,7 +4375,7 @@ def train(args):
                 # ── gate @ FULL context (benchmark `gate_full` analogue): same model,
                 #    K=10M keeps every article token, learned bias APPLIED. Every
                 #    --gate-full-eval-freq'th eval cycle; K-independent → _ki==0 only. ──
-                if (args.gate_full_eval_freq > 0 and _ki == 0
+                if (gate is not None and args.gate_full_eval_freq > 0 and _ki == 0
                         and (step // max(1, args.eval_freq)) % args.gate_full_eval_freq == 0):
                     _gf_pg, _, _gf_pds = _evaluate_per_group(
                         model, gate, tokenizer, _active_eval_by_group, tasks_by_name,
@@ -4316,7 +4430,7 @@ def train(args):
             # swa_gate is created on all ranks (all-rank SWA update) and _swa_eval_cycle is
             # incremented identically, so it is.  Off / single-GPU -> the old rank-0-only path.
             _swa_ddp = bool(getattr(args, "swa_eval_ddp", True)) and world_size > 1
-            if (is_main or _swa_ddp) and swa_gate is not None:
+            if (is_main or _swa_ddp) and swa_n > 0:
                 _swa_eval_cycle += 1
                 _run_swa_eval_this_cycle = (
                     args.swa_eval_freq <= 1
@@ -4325,8 +4439,9 @@ def train(args):
             else:
                 _run_swa_eval_this_cycle = False
             if (is_main or _swa_ddp) and _run_swa_eval_this_cycle:
-                if swa_gate is not None:
-                    swa_gate.eval()
+                if swa_n > 0:
+                    if swa_gate is not None:
+                        swa_gate.eval()
                     # Swap the SWA-averaged adapter (ΔW) into `model` for the SWA eval so it
                     # evaluates a TRUE average of ALL trainable params (gate + adapter), not the
                     # averaged gate bolted onto the live adapter.  Each participating rank swaps in
@@ -4384,6 +4499,10 @@ def train(args):
                                 for _i in range(0, len(_last_batch_data), 4):
                                     _mini = _last_batch_data[_i: _i + 4]
                                     try:
+                                        if swa_gate is None:
+                                            _swa_train_total += sum(float(answer_loss(model, item)) for item in _mini)
+                                            _swa_train_n += len(_mini)
+                                            continue
                                         _sl, _lm, _ = forward_with_gate_batched(
                                             model, swa_gate, _mini, args.gate_layer,
                                             frozen_backbone=True,
@@ -4418,7 +4537,7 @@ def train(args):
 
             if is_main and _wandb_run is not None:
                 _wandb_run.log(_add_baselines(_wandb_log), step=step)
-            gate.train()
+            if gate is not None: gate.train()
             import gc as _gce
             _gce.collect()
             torch.cuda.empty_cache()
@@ -4434,7 +4553,12 @@ def train(args):
         if world_size > 1:
             dist.barrier()
 
-    while step < args.steps:
+    if resume_state is not None:
+        restore_rng(resume_state["rng_by_rank"][rank])
+    _stop_requested = False
+    while step < args.steps and not _stop_requested:
+        _step_start = time.monotonic()
+        _step_lr = optimizer.param_groups[0]["lr"]
         _skip_grad_sync = False
         # Residual-decomposition timers (opt-in): iteration start; data-prep and
         # forward/backward host-wall and clip are captured below.  perf_counter =
@@ -4442,7 +4566,7 @@ def train(args):
         _t_iter = time.perf_counter() if _prof_other else 0.0
         _data_prep_ms = _fwd_bwd_wall_ms = _clip_ms = _logging_ms = float("nan")
         # Log full diagnostics + wandb this step? (essentials still log every step.)
-        _do_diag = (step % _train_log_freq == 0)
+        _do_diag = gate is not None and (step % _train_log_freq == 0)
         # Collect the expensive per-sample gate stats this step? (subset of diag.)
         _do_stats = _do_diag and (step % _per_sample_stats_freq == 0)
         # Collect phase-2 attention stats in the forward only on diag steps (rank 0);
@@ -4469,9 +4593,10 @@ def train(args):
         # grad-tracking tensor — clearing it to a leaf zero would block the
         # backward through sum-of-sigmoid means.
         _gate_inner = gate.module if hasattr(gate, "module") else gate
-        _gate_inner._sparsity_term = None
-        _gate_inner._kept_counts = []
-        _gate_inner._n_art_counts = []
+        if _gate_inner is not None:
+            _gate_inner._sparsity_term = None
+            _gate_inner._kept_counts = []
+            _gate_inner._n_art_counts = []
         _gate_capture[0] = False
         # Capture gate outputs only on steps whose per-sample stats we'll log
         # (rank 0) — skips the buffer append + downstream .item() loop otherwise.
@@ -4499,6 +4624,8 @@ def train(args):
                     if n_art > 0 and sample["n_ans"] > 0 \
                             and len(sample["full_ids"]) <= _batch_seq_cap:
                         break
+                    if strict:
+                        raise ValueError("Invalid training row; fixed protocol cannot resample")
                     sample = _sample_train(step)
                 n_art = sample["article_end"] - sample["article_start"]
                 K = _sample_K(step, n_art)
@@ -4525,15 +4652,22 @@ def train(args):
             _p12_len_log = None  # (phase-1 len, phase-2 len stats) for W&B
 
             try:
-                gate.train()
-                if getattr(args, "use_packed_sequences", False):
+                if gate is not None:
+                    gate.train()
+                if gate is None:
+                    batch_loss = sum(answer_loss(model, row) for row in batch_data)
+                    n_valid = len(batch_data)
+                    batch_loss_letter = batch_loss_eos = 0.0
+                elif getattr(args, "use_packed_sequences", False):
                     # Pack the per-step batch into packed element(s) with
                     # segment-causal attention.  Numerically equivalent to the
                     # padded batched path (argmax-match verified); eliminates
                     # the intra-batch padding waste when batch_size > 1.
                     from tokengate.e2e_gate.train.packed_sequences import (
-                        pack_samples as _pack_samples,
                         forward_with_gate_packed as _fwd_packed,
+                    )
+                    from tokengate.e2e_gate.train.packed_sequences import (
+                        pack_samples as _pack_samples,
                     )
                     _packing_input = [
                         {"full_ids": it["input_ids"],
@@ -4603,17 +4737,11 @@ def train(args):
                             # lanes use the nearest power of two of L (bounded keys);
                             # the ACTUAL sampled L is exact.
                             import math as _math
-                            import random as _rnd2
                             _item0 = batch_data[0]
                             _nart0 = _item0["article_end"] - _item0["article_start"]
                             _seq0 = len(_item0["input_ids"])
                             _plen0 = _seq0 - _nart0
-                            _lo = 128.0
-                            _hi = max(_lo + 1.0, _seq0 / 2.0)
-                            _rlu = _rnd2.Random((args.seed + 1) * 1000003 + step)
-                            _L2 = int(round(_math.exp(_rlu.uniform(
-                                _math.log(_lo), _math.log(_hi)))))
-                            _K2 = max(1, min(_nart0, _L2 - _plen0))
+                            _L2, _K2 = sampled_budget(_item0, args.seed, step)
                             _warn_scaffold_infeasible([_L2], _plen0, _nart0,
                                                       "phase2_loguniform", is_main)
                             _p2lu_lane = max(128, min(8192,
@@ -4728,7 +4856,9 @@ def train(args):
                         # per-phase-2-length train loss (accumulate this rank's per-K CE,
                         # keyed by the phase-2 LENGTH target; flushed at the log cadence).
                         if is_main:
-                            from tokengate.e2e_gate.gate_module import gate_forward as _gfmod
+                            from tokengate.e2e_gate.gate_module import (
+                                gate_forward as _gfmod,
+                            )
                             _pk = _gfmod.LAST_PER_K_TRAIN_LOSS
                             if _pk is not None:
                                 if getattr(args, "phase2_bucket_lists", None):
@@ -4783,6 +4913,8 @@ def train(args):
                                 batch_loss_eos += F.cross_entropy(sample_logits[-1:], sample_labels[-1:]).item()
                             n_valid += 1
 
+                if strict and n_valid == 0:
+                    raise RuntimeError("Training produced no valid answer loss")
                 if n_valid == 0:
                     optimizer.zero_grad(set_to_none=True)
                     _skip_grad_sync = True
@@ -4835,6 +4967,8 @@ def train(args):
                 _last_batch_data = batch_data
                 
             except (torch.cuda.OutOfMemoryError, RuntimeError) as _oom_err:
+                if strict:
+                    raise
                 # See single-sample handler for the rationale: FlexAttention
                 # kernel-launch driver OOMs surface as plain RuntimeError, not
                 # torch.cuda.OutOfMemoryError, so we widen the catch.  Re-raise
@@ -4854,6 +4988,7 @@ def train(args):
                 # Without this, post-OOM steps cascade-OOM even on small sequences
                 # because the allocator stays fragmented.
                 import gc as _gc
+
                 from tokengate.e2e_gate.attn.flex_attention_utils import (
                     clear_block_mask_cache as _cbmc,
                 )
@@ -4867,6 +5002,11 @@ def train(args):
                 optimizer.zero_grad(set_to_none=True)
                 _skip_grad_sync = True
         
+            finally:
+                if gate is not None:
+                    gate._sparsity_term = None
+                    gate._kept_counts = []
+                    gate._n_art_counts = []
         _gate_capture[0] = False
 
         grad_norm = 0.0
@@ -4907,32 +5047,7 @@ def train(args):
                 # over a single large message.  Falls back to the per-tensor
                 # loop when world_size == 1 (no comm needed) or when no
                 # parameter has a grad (skip step).
-                if world_size > 1:
-                    _sync_params: List[torch.nn.Parameter] = list(gate.parameters())
-                    if _lora_enabled:
-                        _sync_params.extend(lora_params)
-
-                    _grads = [p.grad for p in _sync_params if p.grad is not None]
-                    if _grads:
-                        # Flatten into a single contiguous buffer for one NCCL
-                        # call.  `_flatten_dense_tensors` returns a new tensor;
-                        # we all_reduce it, then unflatten back into per-grad
-                        # views with the same shape.
-                        from torch._utils import (
-                            _flatten_dense_tensors,
-                            _unflatten_dense_tensors,
-                        )
-                        _flat = _flatten_dense_tensors(_grads)
-                        if _prof_other:
-                            torch.cuda.synchronize()
-                            _t_ar = time.perf_counter()
-                        dist.all_reduce(_flat, op=dist.ReduceOp.AVG)
-                        if _prof_other:
-                            torch.cuda.synchronize()
-                            _allreduce_ms = (time.perf_counter() - _t_ar) * 1000.0
-                        for _g, _new in zip(_grads,
-                                            _unflatten_dense_tensors(_flat, _grads)):
-                            _g.copy_(_new)
+                synchronize_gradients(parameters, world_size, strict=strict)
             else:
                 # All ranks agreed to skip this step — advance step and move on.
                 step += 1
@@ -4949,7 +5064,7 @@ def train(args):
                     _do_checkpoint_save(step)
                 continue
 
-            all_params = list(gate.parameters()) + lora_params
+            all_params = list(parameters.values())
             # Standard gradient clipping.  clip_grad_norm_ returns the total norm;
             # if any grad element is non-finite (a true NaN/inf, which the biodex
             # extreme-small-K STE regime produces on ~80% of steps), the norm is
@@ -4962,7 +5077,7 @@ def train(args):
             if _prof_other:
                 torch.cuda.synchronize()
                 _t_clip = time.perf_counter()
-            _grad_norm_t = torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+            _grad_norm_t = torch.nn.utils.clip_grad_norm_(all_params, 1.0, error_if_nonfinite=strict)
             if _prof_other:
                 torch.cuda.synchronize()
                 _clip_ms = (time.perf_counter() - _t_clip) * 1000.0
@@ -5132,7 +5247,7 @@ def train(args):
                 # live weights are all_reduce-synced each step.  Otherwise rank 0 only (legacy).
                 if is_main or (bool(getattr(args, "swa_eval_ddp", True)) and world_size > 1):
                     _gate_raw_swa = gate
-                    if swa_gate is None:
+                    if swa_n == 0:
                         # Clear transient threshold-mode diagnostic state before
                         # snapshotting: `_sparsity_term` is a non-leaf tensor
                         # (graph-tracked sum-of-sigmoid-means) populated by the
@@ -5140,14 +5255,16 @@ def train(args):
                         # tensor attributes, so we drop it.  These are also
                         # reset at the top of every train step.
                         _gs = _gate_raw_swa.module if hasattr(_gate_raw_swa, "module") else _gate_raw_swa
-                        _gs._sparsity_term = None
-                        _gs._kept_counts = []
-                        _gs._n_art_counts = []
+                        if _gs is not None:
+                            _gs._sparsity_term = None
+                            _gs._kept_counts = []
+                            _gs._n_art_counts = []
                         # First update: clone current weights as the starting average.
                         # fp32 storage (asserted): the running mean is exact only in fp32.
-                        swa_gate = copy.deepcopy(_gate_raw_swa)
-                        assert_fp32_params(swa_gate, "swa_gate")
-                        swa_gate.eval()
+                        if gate is not None:
+                            swa_gate = copy.deepcopy(_gate_raw_swa)
+                            assert_fp32_params(swa_gate, "swa_gate")
+                            swa_gate.eval()
                         swa_n = 1
                         _swa_just_inited = True
                         # Seed the averaged adapter (delta ΔW / LoRA) from the live weights:
@@ -5165,7 +5282,10 @@ def train(args):
                         if _lora_enabled and swa_adapter_sd is not None:
                             swa_inplace_update(swa_adapter_sd.items(),
                                                collect_lora_named_params(model), swa_n)
-                        _swa_update(_gate_raw_swa)
+                        if gate is not None:
+                            _swa_update(_gate_raw_swa)
+                        else:
+                            swa_n += 1
 
                 # No broadcast/barrier/init-eval here.  The old code ran two full
                 # evals (base + swa deepcopy) on rank 0 alone while non-zero ranks
@@ -5226,7 +5346,7 @@ def train(args):
                     else:
                         gate_weight_norm = sum(p.data.norm()**2 for p in proj.parameters()).sqrt().item()
                 else:
-                    gate_weight_norm = sum(p.data.norm()**2 for p in gate.parameters()).sqrt().item()
+                    gate_weight_norm = sum(p.data.norm()**2 for p in gate_parameters).sqrt().item()
 
                 # Per-sample gate-output stats (gate_all_mean/std, gate_topk_mean/std):
                 # the .item()-heavy inner loop → only on PER_SAMPLE_STATS_FREQ steps.
@@ -5239,7 +5359,7 @@ def train(args):
                         _k_per_sample = [max(1, min(item["K"], item["article_end"] - item["article_start"]))
                                          for item in batch_data]
                     else:
-                        _k_per_sample = [K_clamped]
+                        _k_per_sample = [avg_K_clamped]
                     _agg_w_cpu = (gate.agg_weights.detach().float().cpu()
                                   if hasattr(gate, "agg_weights") and gate.agg_weights is not None else None)
                     _all_means, _all_stds, _topk_means, _topk_stds = [], [], [], []
@@ -5435,6 +5555,18 @@ def train(args):
             _logging_ms = (time.perf_counter() - _t_log0) * 1000.0
 
         step += 1
+        if strict:
+            torch.cuda.synchronize()
+            elapsed = prior_seconds + time.monotonic() - started
+            total, budget = sampled_budget(batch_data[0], args.seed, step - 1) if gate is not None else (None, None)
+            record = dict(step=step, rank=rank, loss=logged_loss, grad_norm=float(grad_norm),
+                          lr=_step_lr, sampled_length=total, budget=budget,
+                          prompt_tokens=batch_data[0]["ctx_len"],
+                          step_seconds=time.monotonic() - _step_start, elapsed_seconds=elapsed,
+                          gpu_hours=elapsed * world_size / 3600,
+                          peak_allocated_bytes=torch.cuda.max_memory_allocated())
+            with (output / f"train-rank{rank}.jsonl").open("a") as stream:
+                stream.write(json.dumps(record, allow_nan=False) + "\n")
 
         # ── Throughput profile line (one per successful UPDATE step) ───────────
         # dt = wall-clock since the previous successful update = steady-state s/it.
@@ -5517,13 +5649,13 @@ def train(args):
         # _do_eval is a closure defined above the loop; called from both the
         # success path here AND the all-skip path so eval_freq isn't
         # probabilistically dropped by OOM-skip races (same fix as checkpoint).
-        if step % args.eval_freq == 0:
+        if step % args.eval_freq == 0 or (strict and step == args.steps):
             _do_eval()
 
         # ── Checkpoint ───────────────────────────────────────────────────────
         # _do_checkpoint_save guards on is_main internally; defined as a closure
         # before the loop so the all-skip branch (line ~4063) can call it too.
-        if step % args.checkpoint_freq == 0:
+        if step % args.checkpoint_freq == 0 or (strict and step == args.steps):
             _do_checkpoint_save(step)
 
     if is_main:
@@ -5532,30 +5664,31 @@ def train(args):
     if is_main:
         print(f"\n[train] Done. {step} steps in {elapsed / 60:.1f} min.")
 
-    if is_main and not args.profile:
+    if is_main and not args.profile and not strict:
         # ── Save final gate ───────────────────────────────────────────────────
         # Skipped under --profile so throughput/boundary probes don't overwrite a
         # real run's gate_final.pt / lora_final.pt / params.json when they share an
         # output dir (dir name doesn't encode frac_max_k or profile flags).
-        final_path = os.path.join(args.output_dir, "gate_final.pt")
-        save_gate(gate, final_path, metadata={
-            "step": step,
-            "gate_layer": args.gate_layer,
-            "phase2_len_list": args.phase2_len_list,
-            "phase2_bucket_lists": args.phase2_bucket_lists,
-            "length_buckets": getattr(args, "length_buckets", None),
-            "base_model": args.base_model,
-            "task": args.task,
-            "dataset": args.dataset,
-            "train_samples": len(tokenized_train),
-            "adapter_type": args.adapter_type if _lora_enabled else None,
-            "lora_layer_ids": lora_layer_ids if _lora_enabled else None,
-            "lora_rank": args.lora_rank if (_lora_enabled and args.adapter_type == "lora") else None,
-            "lora_alpha": args.lora_alpha if (_lora_enabled and args.adapter_type == "lora") else None,
-            "lora_targets": args.lora_targets if (_lora_enabled and args.adapter_type == "lora") else None,
-            "lora_start_layer": lora_start_layer if _lora_enabled else None,
-        })
-        print(f"[train] Final gate saved to {final_path}")
+        if gate is not None:
+            final_path = os.path.join(args.output_dir, "gate_final.pt")
+            save_gate(gate, final_path, metadata={
+                "step": step,
+                "gate_layer": args.gate_layer,
+                "phase2_len_list": args.phase2_len_list,
+                "phase2_bucket_lists": args.phase2_bucket_lists,
+                "length_buckets": getattr(args, "length_buckets", None),
+                "base_model": args.base_model,
+                "task": args.task,
+                "dataset": args.dataset,
+                "train_samples": len(tokenized_train),
+                "adapter_type": args.adapter_type if _lora_enabled else None,
+                "lora_layer_ids": lora_layer_ids if _lora_enabled else None,
+                "lora_rank": args.lora_rank if (_lora_enabled and args.adapter_type == "lora") else None,
+                "lora_alpha": args.lora_alpha if (_lora_enabled and args.adapter_type == "lora") else None,
+                "lora_targets": args.lora_targets if (_lora_enabled and args.adapter_type == "lora") else None,
+                "lora_start_layer": lora_start_layer if _lora_enabled else None,
+            })
+            print(f"[train] Final gate saved to {final_path}")
         if _lora_enabled:
             lora_final_path = os.path.join(args.output_dir, "lora_final.pt")
             torch.save(collect_lora_state_dict(model), lora_final_path)
@@ -5564,10 +5697,10 @@ def train(args):
     # Final eval (all ranks participate).  Skipped under --profile (this decode-
     # heavy sweep is pure overhead for a throughput run and adds ~10 min after
     # the loop).  Guard is identical on every rank → no barrier desync.
-    if eval_samples and not args.profile:
+    if eval_samples and not args.profile and not strict:
         if world_size > 1:
             dist.barrier()
-        gate.eval()
+        if gate is not None: gate.eval()
         if is_main:
             eval_steps.append(step)
             _wandb_log = {"eval/epoch": step * (args.batch_size * world_size) / len(tokenized_train)}
@@ -5645,8 +5778,9 @@ def train(args):
 
         # ── Final SWA eval + save (rank 0 only) ───────────────────────────────
         if is_main:
-            if swa_gate is not None:
-                swa_gate.eval()
+            if swa_n > 0:
+                if swa_gate is not None:
+                    swa_gate.eval()
                 # Swap the averaged adapter in for the final SWA eval too (lora_final.pt =
                 # the LIVE adapter was already saved above, so this is safe); restore after.
                 _live_adapter_sd = None
@@ -5716,20 +5850,21 @@ def train(args):
                     "lora_start_layer": lora_start_layer if _lora_enabled else None,
                 })
                 print(f"[train] SWA gate saved to {swa_final_path}  (n={swa_n} updates)")
-                # Deployable SWA needs the averaged adapter too (delta ΔW / LoRA), not just
-                # the averaged gate — pair swa_gate_final.pt with swa_lora_final.pt at eval.
-                if _lora_enabled and swa_adapter_sd is not None:
-                    swa_lora_path = os.path.join(args.output_dir, "swa_lora_final.pt")
-                    torch.save({k: v.detach().cpu() for k, v in swa_adapter_sd.items()},
-                               swa_lora_path)
-                    print(f"[train] SWA adapter saved to {swa_lora_path}  (n={swa_n} updates)")
+            # Deployable SWA needs the averaged adapter too (delta ΔW / LoRA), not just
+            # the averaged gate — pair swa_gate_final.pt with swa_lora_final.pt at eval.
+            if _lora_enabled and swa_adapter_sd is not None:
+                swa_lora_path = os.path.join(args.output_dir, "swa_lora_final.pt")
+                torch.save({k: v.detach().cpu() for k, v in swa_adapter_sd.items()},
+                           swa_lora_path)
+                print(f"[train] SWA adapter saved to {swa_lora_path}  (n={swa_n} updates)")
 
-        gate.train()
+        if gate is not None: gate.train()
         if world_size > 1:
             dist.barrier()
 
     if is_main:
-        _gate_hook_handle.remove()
+        if _gate_hook_handle is not None:
+            _gate_hook_handle.remove()
         _save_curves(train_losses, k_log, eval_accs, eval_losses, eval_steps, args.output_dir,
                      bias_norm_log=bias_norm_log,
                      attn_scale_log=attn_scale_log,
@@ -5743,6 +5878,10 @@ def train(args):
         if _wandb_run is not None:
             _wandb_run.finish()
 
+    if strict and is_main:
+        atomic_json(dict(step=step, complete=_stop_requested or step >= max_steps,
+                         reason="validation_patience" if _stop_requested else "step_limit",
+                         selection=selection.best), output / "status.json")
     if world_size > 1:
         dist.destroy_process_group()
 
@@ -5988,6 +6127,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train E2E gate for layer-based KV token pruning."
     )
+    parser.add_argument("--no-gate", action="store_true", help="Train only the adapter with full-context SFT")
     parser.add_argument("--base-model", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--dataset", type=str, default="biodex",
                         help="Dataset name, or comma-separated list of datasets for "
@@ -6031,7 +6171,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "Default 1 = eval all K values every cycle.  Set to e.g. 5 to "
                              "cut K-side eval cost ~3x (5 cycles of 1 K + 1 cycle of 3 K) "
                              "with sparser non-primary-K W&B lines.")
-    parser.add_argument("--attn-backends", type=str, default="fa2", choices=["flex", "flash", "fa2"],
+    parser.add_argument("--attn-backends", type=str, default="fa2", choices=["flex", "flash", "fa2", "sdpa"],
                         help="attention kernels for the patched layers: fa2 (the DEFAULT and the final-run "
                              "configuration: Phase 1 as FlashAttention-2 through SDPA, Phase 2 on the "
                              "FlashAttention-2 fork with a per-key bias, kernels/fa2bias); flash "
@@ -6516,8 +6656,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     parser = build_parser()
-    args = parser.parse_args()
-    if args.attn_backends == "fa2":
+    if "--reproduction-config" in sys.argv:
+        recipe_parser = argparse.ArgumentParser(description="Fixed NIAH training protocol")
+        recipe_parser.add_argument("--reproduction-config", type=Path, required=True)
+        recipe_parser.add_argument("--resume", action="store_true")
+        recipe_parser.add_argument("--stop-after", type=int)
+        recipe_args = recipe_parser.parse_args()
+        args = reproduction_args(json.loads(recipe_args.reproduction_config.read_text()),
+                                 resume=recipe_args.resume, stop_after=recipe_args.stop_after)
+    else:
+        args = parser.parse_args()
+    if args.attn_backends == "sdpa" and not args.no_gate:
+        parser.error("sdpa is only supported for --no-gate training")
+    if args.attn_backends == "fa2" and not args.no_gate:
         # Fail at startup, not at the first attention call: the fa2 training
         # step (and packed Phase 2) has no runtime fallback, unlike inference.
         from kernels.fa2bias.keybias import available as _fa2_bias_available
@@ -6538,6 +6689,8 @@ def main():
     if args.phase2_len_list and args.phase2_bucket_lists:
         parser.error("--phase2-len-list and --phase2-bucket-lists are "
                      "mutually exclusive.")
+    if args.no_gate and (args.random_topk or args.lora_rank <= 0 or args.gate_selection != "topk"):
+        parser.error("--no-gate requires LoRA and excludes random/threshold gate selection")
     _validate_random_topk_args(parser, args)
     if args.adapter_type == "delta" and (args.lora_rank > 0
                                          or args.lora_targets is not None):
@@ -6575,6 +6728,161 @@ def _validate_random_topk_args(parser, args):
             "--adapter-type delta); otherwise nothing is trained "
             "(the gate is frozen)."
         )
+
+
+
+
+def synchronize_gradients(parameters: dict, world_size: int, *, strict=True) -> None:
+    """Average all trainable gradients; fail on missing or nonfinite gradients."""
+    gradients = []
+    for name, p in parameters.items():
+        if p.grad is None:
+            if strict:
+                raise RuntimeError(f"Missing training gradient: {name}")
+            continue
+        gradients.append(p.grad)
+    if not gradients:
+        return
+    flat = torch.cat([gradient.reshape(-1) for gradient in gradients])
+    if world_size > 1:
+        dist.all_reduce(flat)
+        flat.div_(world_size)
+    if strict and not torch.isfinite(flat).all():
+        raise FloatingPointError("Nonfinite training gradient; no update was applied")
+    offset = 0
+    for gradient in gradients:
+        count = gradient.numel()
+        gradient.copy_(flat[offset : offset + count].view_as(gradient))
+        offset += count
+
+
+@torch.no_grad()
+def evaluate_reproduction(
+    model,
+    gate,
+    tokenizer,
+    rows: list[dict],
+    config: dict,
+    *,
+    budget: int | None,
+    step: int,
+    variant: str,
+    rank: int,
+    world_size: int,
+    output: Path,
+) -> dict:
+    """Return global accuracy and mean per-example answer loss."""
+    model.eval()
+    if gate is not None:
+        gate.eval()
+    task = NiahKamradtTask()
+    totals = torch.zeros(3, device=model.device, dtype=torch.float64)
+    suffix = "full" if budget is None else str(budget)
+    path = output / f"step{step}-{variant}-K{suffix}-rank{rank}.jsonl"
+    with path.open("w") as stream:
+        for row in rows[rank::world_size]:
+            prompt = row["input_ids"][: row["ctx_len"]]
+            effective_budget = budget or row["article_end"] - row["article_start"]
+            result = generate_batch(
+                model, gate, tokenizer, [prompt], [row["article_start"]],
+                [row["article_end"]], config["gate_layer"], effective_budget,
+                config["max_gen_tokens"],
+            )
+            prediction = result.answers[0]
+            token_ids = result.token_ids[0]
+            kept = result.kept_pos[0, :result.n_kepts[0]].cpu().tolist()
+            loss = float(
+                answer_loss(model, row, gate, config["gate_layer"], effective_budget)
+            )
+            accuracy = task.evaluate(prediction, row["target"])
+            totals += totals.new_tensor([accuracy, loss, 1])
+            stream.write(
+                json.dumps(
+                    {
+                        "id": row["id"],
+                        "prediction": prediction,
+                        "token_ids": token_ids,
+                        "target": row["target"],
+                        "accuracy": accuracy,
+                        "loss": loss,
+                        "kept_positions": kept,
+                        "prompt_tokens": len(prompt),
+                        "budget": budget,
+                    }
+                )
+                + "\n"
+            )
+    if world_size > 1:
+        dist.all_reduce(totals)
+    correct, loss_sum, count = totals.cpu().tolist()
+    if count != len(rows):
+        raise RuntimeError("Validation did not score every requested example")
+    return {"accuracy": correct / count, "loss": loss_sum / count, "count": int(count)}
+
+
+def sampled_budget(row: dict, seed: int, step: int) -> tuple[int, int]:
+    """Return sampled total length and K using the released loguniform rule."""
+    length = len(row["input_ids"])
+    prunable = row["article_end"] - row["article_start"]
+    rng = random.Random((seed + 1) * 1000003 + step)
+    total = round(math.exp(rng.uniform(math.log(128), math.log(max(129, length / 2)))))
+    return total, max(1, min(prunable, total - (length - prunable)))
+
+
+def answer_loss(model, row: dict, gate=None, gate_layer=None, budget=None):
+    """Mean next-token cross-entropy over the answer including EOS."""
+    device = model.device
+    start = row["ctx_len"]
+    count = row["n_ans"]
+    labels = torch.tensor(row["input_ids"][start : start + count], device=device)
+    if gate is None:
+        logits, mask, _ = forward_lora_baseline_batched(model, [row], answer_only=True)
+    else:
+        item = {**row, "K": budget}
+        logits, mask, _ = forward_with_gate_batched(
+            model,
+            gate,
+            [item],
+            gate_layer,
+            frozen_backbone=True,
+        )
+    logits = logits[0, mask[0]]
+    if logits.shape[0] != count:
+        raise ValueError("Answer logit/label alignment is incorrect")
+    return F.cross_entropy(logits, labels)
+
+
+
+def reproduction_args(config: dict, *, resume=False, stop_after=None):
+    """Translate a fixed run into the normal trainer's options and evidence policy."""
+    from tokengate.trainer import TokenGateConfig, TokenGateTrainer
+
+    if config["batch_size"] != 1 or config["grad_accum"] != 1:
+        raise ValueError("The fixed protocol requires one example per rank without accumulation")
+    if config["gate_selection"] != "topk" or config["random_topk"]:
+        raise ValueError("The fixed protocol requires deterministic top-K selection")
+    sft = config["gate_layer"] is None
+    options = TokenGateConfig(
+        base_model=config["base_model"], gate_layer=config["gate_layer"],
+        output_dir=config["output_dir"], learning_rate=config["learning_rate"],
+        epochs=config["epochs"], k_eval=[2000], lora_rank=config["lora_rank"],
+        lora_alpha=config["lora_alpha"], lora_lr=config["learning_rate"],
+        lora_targets=config["lora_targets"], seed=config["seed"],
+        optim="adamw" if sft else "muon", gate_optimizer="adamw" if sft else "muon",
+        batch_size=config["batch_size"], grad_accum=config["grad_accum"],
+        warmup_steps=config["warmup_steps"], eval_freq=config["eval_freq"],
+        eval_gen_batch_size=1, eval_split=config["eval_split_manifest"],
+        swa_freq=1, max_gen_tokens=config["max_gen_tokens"], log_examples=0,
+        data_root=str(Path(config["root"]) / "data/prepared"),
+        attn_backend=config["attn_backend"], compile_phase2=config["compile_phase2"],
+        pack_phase2=config["pack_phase2"], num_gpus=config["world_size"],
+        max_steps=stop_after,
+    )
+    trainer = TokenGateTrainer(options, train_dataset="niah_kamradt/niah_kamradt")
+    args = build_parser().parse_args(trainer._trainer_args())
+    args.reproduction = config
+    args.reproduction_resume = resume
+    return args
 
 
 if __name__ == "__main__":

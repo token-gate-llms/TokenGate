@@ -2,7 +2,9 @@
 
 import json
 import random
-from typing import List, Dict, Any, Optional
+import pickle
+from pathlib import Path
+from typing import List, Dict, Any
 
 from datasets import load_dataset
 
@@ -206,3 +208,102 @@ def get_article_text_for_dataset(sample: Dict[str, Any], dataset_name: str, doc_
     if dataset_name.startswith("longbench"):
         return get_longbench_article_text(sample)
     return get_biodex_article_text(sample)
+
+
+def partition_rows(rows: list[dict], manifest: dict, tier: str) -> list[dict]:
+    """Validate the complete evaluation pool before assigning partitions."""
+    expected = {"16k": (50, 150), "32k": (16, 184)}[tier]
+    validation, test = manifest["val"], manifest["test"]
+    if (len(validation), len(test)) != expected:
+        raise ValueError(f"Incorrect {tier} partition sizes")
+    validation, test = set(validation), set(test)
+    ids = [row["id"] for row in rows]
+    if (
+        (len(validation), len(test)) != expected
+        or validation.intersection(test)
+        or len(ids) != 200
+        or len(set(ids)) != 200
+        or set(ids) != validation | test
+    ):
+        raise ValueError("Evaluation IDs must exactly cover disjoint partitions")
+    result = []
+    for row in rows:
+        if row["prompt_version"] != "niah_v1":
+            raise ValueError("Unexpected NIAH prompt version")
+        start, end, context = row["article_start"], row["article_end"], row["ctx_len"]
+        if not 0 <= start < end <= context < len(row["full_ids"]):
+            raise ValueError(f"Invalid prompt boundaries for {row['id']}")
+        if len(row["full_ids"]) - context != row["n_ans"]:
+            raise ValueError(f"Invalid answer boundary for {row['id']}")
+        result.append(
+            {
+                **row,
+                "input_ids": row["full_ids"],
+                "partition": "validation" if row["id"] in validation else "test",
+            }
+        )
+    return result
+
+
+def load_rows(config: dict, tier: str) -> tuple[list[dict], dict]:
+    """Verify saved hashes and attach city/depth to every prepared example."""
+    from tokengate.e2e_gate.artifacts import file_hash
+
+    root = Path(config["root"])
+    hashes_path = root / "configs/data-hashes.json"
+    if file_hash(hashes_path) != config["data_hash_manifest_sha256"]:
+        raise ValueError("Prepared data manifest changed after training started")
+    hashes = json.loads(hashes_path.read_text())
+    dataset = "niah_kamradt" if tier == "16k" else "niah_kamradt_32k"
+    model = Path(config["base_model"]).name
+    prepared = root / f"data/prepared/{dataset}/{dataset}/tokenized/{model}/val.pkl"
+    generated = (
+        root
+        / "data"
+        / ("niah_kamradt_all.jsonl" if tier == "16k" else "niah_kamradt_32k.jsonl")
+    )
+    manifest_path = Path(config["eval_split_manifest"])
+    if tier == "32k":
+        manifest_path = manifest_path.with_name(
+            "longbench_eval_split_niah32k_iso_v1.json"
+        )
+    evidence = {}
+    for path in (prepared, generated):
+        relative = str(path.relative_to(root))
+        digest = file_hash(path)
+        if digest != hashes[relative]:
+            raise ValueError(f"Prepared data changed: {path}")
+        evidence[relative] = digest
+    with prepared.open("rb") as stream:
+        rows = partition_rows(
+            pickle.load(stream), json.loads(manifest_path.read_text())[dataset], tier
+        )
+    metadata = {}
+    with generated.open() as stream:
+        for line in stream:
+            item = json.loads(line)
+            if item["split"] == "test":
+                if item["id"] in metadata:
+                    raise ValueError("Duplicate generated evaluation ID")
+                metadata[item["id"]] = item
+    if set(metadata) != {row["id"] for row in rows}:
+        raise ValueError("Generated and tokenized evaluation IDs differ")
+    for row in rows:
+        item = metadata[row["id"]]
+        if item["answer"] != row["target"]:
+            raise ValueError(f"Generated and tokenized targets differ: {row['id']}")
+        row.update(
+            city=item["city"],
+            depth_requested=item["depth_req"],
+            depth_actual=item["depth_actual"],
+        )
+    evidence[str(manifest_path)] = file_hash(manifest_path)
+    return rows, evidence
+
+
+def validation_rows(directory: Path, manifest_path: Path) -> list[dict]:
+    """Use the same partition checks for training validation and final evaluation."""
+    manifest = json.loads(manifest_path.read_text())["niah_kamradt"]
+    with (directory / "val.pkl").open("rb") as stream:
+        rows = partition_rows(pickle.load(stream), manifest, "16k")
+    return [row for row in rows if row["partition"] == "validation"]

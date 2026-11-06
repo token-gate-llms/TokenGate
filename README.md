@@ -237,6 +237,41 @@ set above plus `liana313/tokengate-2wikimqa-qwen3-1.7b`,
 `liana313/tokengate-niah-qwen3.5-2b` — each repo holds the exact gate+LoRA
 checkpoint the paper's benchmarks used.
 
+### Fixed NIAH reproduction
+
+The [reproduction recipe](train-scripts/niah/reproduction.yaml) specifies two
+backbones, six SFT/gate configurations, three seeds, pinned model/tokenizer and
+corpus revisions, and the evaluation budgets. Gate training samples a compressed
+budget and also trains at full retention; inference sweeps the listed budgets.
+SFT is a separately trained, seed-matched LoRA baseline.
+
+Use a source checkout on Linux with four GPUs. The recipe records the measured
+Python/CUDA/package versions; install those versions and the matching CUDA
+PyTorch build before installing this repository. Qwen3.5 requires
+`flash-linear-attention`; Qwen3 requires the key-bias FA2 kernel.
+
+```bash
+pip install -e '.[reproduction]'
+python kernels/fa2bias/build.py
+
+# Choose a writable run directory; generated data and checkpoints stay here.
+NIAH_ROOT="$PWD/experiments/niah/run"
+python train-scripts/niah/reproduce.py --root "$NIAH_ROOT" --stage train --dry-run
+python train-scripts/niah/reproduce.py --root "$NIAH_ROOT" --stage prepare
+python train-scripts/niah/reproduce.py --root "$NIAH_ROOT" --stage smoke --gpus 0,1,2,3
+python train-scripts/niah/reproduce.py --root "$NIAH_ROOT" --stage train --gpus 0,1,2,3
+```
+
+The driver reuses the existing data preparation and translates the recipe into
+`TokenGateConfig`. SFT (`gate_layer=None`) and gated runs use the same training
+loop. Smoke runs compare interrupted/resumed training against
+uninterrupted training, including parameters, optimizer, scheduler, SWA,
+selection and per-rank RNG state.
+Measured training requires a passing smoke from the same source snapshot.
+`--only RUN_ID` selects one run; `--resume --only RUN_ID` explicitly resumes an
+inspected incomplete measured run. Active GPUs and concurrent drivers are refused.
+Failed attempts remain available for diagnosis.
+
 ### Training the TokenGate model
 
 The released checkpoints train from the lane configs under `train-scripts/`

@@ -1,0 +1,98 @@
+# Fixed NIAH reproduction; environment records the measured training runtime.
+seeds:
+- 0
+- 1
+- 2
+budgets:
+- 64
+- 100
+- 128
+- 256
+- 500
+- 512
+- 1024
+- 2000
+- 2048
+- 4096
+- 8192
+- null
+training:
+  gate_selection: topk
+  random_topk: false
+  lora_rank: 16
+  lora_alpha: 32
+  lora_targets:
+  - q_proj
+  - v_proj
+  world_size: 4
+  batch_size: 1
+  grad_accum: 1
+  deterministic: true
+  epochs: 20
+  learning_rate: 0.0001
+  warmup_steps: 1000
+  eval_freq: 600
+  patience: 3
+  max_gen_tokens: 1024
+smoke:
+  warmup_steps: 2
+  eval_freq: 2
+kernels:
+  sft:
+    attn_backend: sdpa
+    compile_phase2: false
+    pack_phase2: false
+  dense_gate:
+    attn_backend: fa2
+    compile_phase2: true
+    pack_phase2: true
+  hybrid_gate:
+    attn_backend: flex
+    compile_phase2: false
+    pack_phase2: false
+runs:
+- model: Qwen3-1.7B
+  gate_layer: null
+  kernels: sft
+- model: Qwen3-1.7B
+  gate_layer: 1
+  kernels: dense_gate
+- model: Qwen3.5-2B
+  gate_layer: null
+  kernels: sft
+- model: Qwen3.5-2B
+  gate_layer: 1
+  kernels: hybrid_gate
+- model: Qwen3.5-2B
+  gate_layer: 2
+  kernels: hybrid_gate
+- model: Qwen3.5-2B
+  gate_layer: 3
+  kernels: hybrid_gate
+qualification:
+  atol: 0.02
+  rtol: 0.02
+  exact_retained_positions: true
+  exact_shared_scorer: true
+  decode_atol: 0
+  decode_rtol: 0
+sources:
+  models:
+    Qwen3-1.7B:
+      repo: Qwen/Qwen3-1.7B
+      revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+    Qwen3.5-2B:
+      repo: Qwen/Qwen3.5-2B
+      revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+  corpus:
+    repo: sgoel9/paul_graham_essays
+    revision: 0c7155a53c25e24c9b9858314460e0ee1f5c3e4e
+environment:
+  python: 3.12.9
+  torch: 2.14.0
+  transformers: 5.22.1
+  triton: 3.8.0
+  flash-linear-attention: 0.6.0
+  vllm: 0.33.0rc1.dev438+g25fc60723.precompiled
+  cuda: '13.0'
+  gpu: NVIDIA A100-SXM4-80GB

@@ -247,13 +247,15 @@ diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_bwd_kernel.h work/csr
                  if constexpr (Is_softcap) { scaled_ds *= dtanh(mi, ni); }
                  dS(mi, ni) = scaled_ds;
              }
-@@ -721,6 +730,25 @@
+@@ -721,6 +730,49 @@
  
      }
  
 +    if constexpr (Has_alibi) {
 +        if (params.dbias_ptr != nullptr) {
++            __shared__ float dbias_partials[AtomLayoutMS][kBlockN];
 +            const int lane_id = tidx % 32;
++            const int warp_row = (tidx / 32) % AtomLayoutMS;
 +            const int col_base = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
 +            float *dbias = reinterpret_cast<float *>(params.dbias_ptr) + bidb * params.dbias_batch_stride + bidh * params.dbias_head_stride;
 +            #pragma unroll
@@ -264,8 +266,30 @@ diff -ruN flash_attn-2.8.3.post1/csrc/flash_attn/src/flash_bwd_kernel.h work/csr
 +                v += __shfl_xor_sync(0xffffffff, v, 16);
 +                if (lane_id < 4) {
 +                    const int col_idx = col_base + (ni / 2) * 8 + (ni % 2);
-+                    if (col_idx < binfo.actual_seqlen_k) { atomicAdd(dbias + col_idx, v * params.scale_softmax); }
++                    if (col_idx < binfo.actual_seqlen_k) {
++                        if (params.deterministic) {
++                            dbias_partials[warp_row][col_idx - n_block * kBlockN] = v * params.scale_softmax;
++                        } else {
++                            atomicAdd(dbias + col_idx, v * params.scale_softmax);
++                        }
++                    }
 +                }
++            }
++            if (params.deterministic) {
++                // Each (batch, head, key block) has one CTA. Reduce its warp
++                // rows in a fixed order instead of issuing unordered atomics.
++                __syncthreads();
++                for (int col = tidx; col < kBlockN; col += blockDim.x) {
++                    if (n_block * kBlockN + col < binfo.actual_seqlen_k) {
++                        float value = 0.0f;
++                        #pragma unroll
++                        for (int row = 0; row < AtomLayoutMS; ++row) {
++                            value += dbias_partials[row][col];
++                        }
++                        dbias[n_block * kBlockN + col] = value;
++                    }
++                }
++                __syncthreads();
 +            }
 +        }
 +    }
