@@ -379,6 +379,17 @@ def gate_layer_mlp(layer, a):
     return fn(layer, a)
 
 
+def is_linear_attention_layer(layer: nn.Module) -> bool:
+    """Read the decoder's config-derived mixer type across HF versions."""
+    layer_type = getattr(layer, "block_type", getattr(layer, "layer_type", None))
+    if layer_type is None and hasattr(layer, "self_attn"):
+        return False
+    if layer_type not in ("linear_attention", "full_attention"):
+        raise ValueError(f"Unsupported decoder mixer: {layer_type!r}")
+    return layer_type == "linear_attention"
+
+
+
 def _attn_only_forward_eager(layer, hidden_states, position_ids, cache, cache_pos, pe):
     """The gate layer's forward UP TO the token-mixer residual: returns a_j.
 
@@ -395,7 +406,7 @@ def _attn_only_forward_eager(layer, hidden_states, position_ids, cache, cache_po
     """
     residual = hidden_states
     hs = layer.input_layernorm(hidden_states)
-    if getattr(layer, "layer_type", "full_attention") == "linear_attention":
+    if is_linear_attention_layer(layer):
         hs = layer.linear_attn(
             hidden_states=hs,
             cache_params=cache,
@@ -443,8 +454,7 @@ def call_layer_padsafe(layer, hs, pad_lens, **kwargs):
     positions were never affected (causality), so the TRAIN forward does not
     route through this helper."""
     call = kwargs.pop("fn", layer)
-    if getattr(layer, "layer_type", "full_attention") != "linear_attention" \
-            or not any(pad_lens):
+    if not is_linear_attention_layer(layer) or not any(pad_lens):
         return call(hs, **kwargs)
     B, S, H = hs.shape
     dev = hs.device

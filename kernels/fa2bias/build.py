@@ -131,9 +131,9 @@ load(
     sources=[str(s) for s in sources],
     extra_include_paths=[str(csrc), str(csrc / "src"), str(SRC / "csrc" / "cutlass" / "include"),
                          str(pathlib.Path(sys.prefix) / "targets" / "x86_64-linux" / "include")],
-    extra_cflags=["-O3", "-std=c++17"],
+    extra_cflags=["-O3", "-std=c++20"],
     extra_cuda_cflags=[
-        "-O3", "-std=c++17", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--use_fast_math",
+        "-O3", "-std=c++20", "--expt-relaxed-constexpr", "--expt-extended-lambda", "--use_fast_math",
         "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
         "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
         "-DFLASHATTENTION_DISABLE_DROPOUT", "-DFLASHATTENTION_DISABLE_SOFTCAP",

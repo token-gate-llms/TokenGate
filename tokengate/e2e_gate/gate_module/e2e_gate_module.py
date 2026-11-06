@@ -86,6 +86,20 @@ def set_gate_diag_stats(enabled: bool) -> None:
     _GATE_DIAG_STATS = bool(enabled)
 
 
+def _qk_norm_gain(norm: nn.Module) -> torch.Tensor:
+    """Return the multiplicative gain used by a supported Qwen RMSNorm."""
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRMSNorm
+
+    weight = norm.weight.detach().float()
+    if isinstance(norm, (Qwen3_5RMSNorm, Qwen3NextRMSNorm)):
+        return 1.0 + weight
+    if isinstance(norm, Qwen3RMSNorm):
+        return weight
+    raise TypeError(f"Unsupported Q/K normalization: {type(norm).__name__}")
+
+
 class CastLinear(nn.Module):
     """Linear with float32 PARAMETER STORAGE whose matmul runs in the INPUT's dtype.
 
@@ -264,6 +278,7 @@ class E2EGate(nn.Module):
         # "threshold" mode the gate keeps article tokens whose sigmoid(b) > tau,
         # producing a sample-dependent K.
         self.selection_mode = selection_mode
+        self.random_topk = False
         self.tau = float(tau)
 
         # The scoring branch (attached post-construction by trainer / loader).
@@ -329,8 +344,8 @@ class E2EGate(nn.Module):
         vals = []
         for row, li in enumerate(idxs):
             attn = layers[li].self_attn
-            gq = attn.q_norm.weight.detach().float()
-            gk = attn.k_norm.weight.detach().float()
+            gq = _qk_norm_gain(attn.q_norm)
+            gk = _qk_norm_gain(attn.k_norm)
             # ||g_q ∘ g_k||_2 / sqrt(d): the L2 norm of the ELEMENTWISE gain
             # product, scaled like the logits — positive by construction,
             # upweights peaky gain coordinates instead of averaging them away.
@@ -403,6 +418,9 @@ def save_gate(gate: E2EGate, path: str, metadata: Dict[str, Any] = None) -> None
     """Save gate checkpoint with metadata dict.  The finalized architecture
     constants are recorded explicitly so the checkpoint is self-describing and
     pre-freeze tooling can still identify it."""
+    if type(gate.random_topk) is not bool:
+        raise ValueError("Cannot save a gate with unknown random_topk provenance")
+    metadata = {**getattr(gate, "training_provenance", {}), **(metadata or {})}
     torch.save(
         {
             "state_dict": gate.state_dict(),
@@ -410,6 +428,7 @@ def save_gate(gate: E2EGate, path: str, metadata: Dict[str, Any] = None) -> None
             "n_heads": gate.n_heads,
             "n_layers_bias": gate.n_layers_bias,
             "selection_mode": gate.selection_mode,
+            "random_topk": gate.random_topk,
             "tau": gate.tau,
             # finalized constants (validated, not configurable, on load):
             "head_agg": "avg",
@@ -523,4 +542,15 @@ def load_gate(path: str) -> Tuple[E2EGate, Dict[str, Any]]:
             f"missing={_missing}, unexpected={_unexpected}")
     assert_fp32_params(gate.gate_branch, f"load_gate({path!r}) scoring branch")
 
+    # Legacy checkpoints did not record this policy. Preserve the uncertainty
+    # instead of certifying an absent field as deterministic selection.
+    random_topk = obj.get("random_topk")
+    if random_topk is not None and type(random_topk) is not bool:
+        raise ValueError("random_topk must be a boolean when recorded")
+    gate.random_topk = random_topk
+    gate.training_provenance = {
+        key: obj.get("metadata", {})[key]
+        for key in ("run_id", "params_sha256")
+        if key in obj.get("metadata", {})
+    }
     return gate, obj.get("metadata", {})
