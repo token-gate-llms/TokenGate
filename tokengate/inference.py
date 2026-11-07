@@ -68,6 +68,7 @@ class GenerateOutput:
     kept_pos: List[List[int]]  # kept token positions (into the clean prompt ids)
     prefill_s: float         # CUDA-synced prefill wall (whole batch)
     decode_s: float          # CUDA-synced decode wall (whole batch)
+    token_ids: List[List[int]]  # generated IDs, including EOS when reached
 
 
 class TokenGateModel:
@@ -93,6 +94,7 @@ class TokenGateModel:
         *,
         max_new_tokens: int = 20,
         max_kept_prefill_tokens: Optional[int] = None,
+        streamer=None,
     ) -> GenerateOutput:
         """Gated prefill + greedy decode (the standard ``generate`` call).
 
@@ -105,6 +107,9 @@ class TokenGateModel:
         max_kept_prefill_tokens : at most this many state tokens survive
             prefill into the KV cache (the paper's K). None = keep all
             (no pruning).
+        streamer : optional object with ``put(cpu_token_ids)`` and ``end()``.
+            Receives generated tokens, including EOS, for a single input.
+            Prompt tokens are not emitted. None leaves generation unchanged.
         """
         if ids and isinstance(ids[0], int):
             ids = [ids]
@@ -117,14 +122,14 @@ class TokenGateModel:
         from tokengate.e2e_gate.decode.gate_decode import generate_batch
         res = generate_batch(
             self.model, self.gate, tokenizer, clean_ids, starts, ends,
-            self.gate_layer, k, max_new_tokens)
+            self.gate_layer, k, max_new_tokens, streamer=streamer)
         kept_pos = [res.kept_pos[b, :n].cpu().tolist()
                     for b, n in enumerate(res.n_kepts)]
         return GenerateOutput(
             answers=res.answers, n_kept=res.n_kepts,
             n_state=[e - s for s, e in zip(starts, ends)],
             kept_pos=kept_pos,
-            prefill_s=res.prefill_s, decode_s=res.decode_s)
+            prefill_s=res.prefill_s, decode_s=res.decode_s, token_ids=res.token_ids)
 
 
 def load_model(

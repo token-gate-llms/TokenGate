@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+*.DS_Store
 
 # Virtual environments
 .venv
@@ -62,3 +63,9 @@ paper-benchmarks/results/**/*.pkl
 paper-benchmarks/results/**/*.log
 datasets/niah_kamradt/niah_kamradt_64k.jsonl
 datasets/niah_kamradt/niah_kamradt_128k.jsonl
+
+# Folder for temporary files that should not be tracked
+temp/
+
+# Benchmark results
+results/

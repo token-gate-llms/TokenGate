@@ -44,6 +44,7 @@ from tokengate.e2e_gate.gate_module.gate_forward import (
 )
 from tokengate.e2e_gate.attn.qwen3_flex_attention import (
     FormDecodeState,
+    get_full_attn_layer_indices,
     set_attn_scale_for_layers,
     set_gate_bias_for_layers,
     set_ssmax_ratio_for_layers,
@@ -79,6 +80,7 @@ class GateDecodeResult:
     prefill_s: float
     decode_s: float
     steps: int                # decode steps executed (batch-wide)
+    token_ids: List[List[int]]  # generated IDs, through the first EOS inclusive
 
 
 @torch.no_grad()
@@ -95,6 +97,7 @@ def generate_batch(
     *,
     decode_phase2_form: bool = True,
     prune_below_gate: bool = False,
+    streamer=None,
 ) -> GateDecodeResult:
     """Batched gate prefill + greedy decode.
 
@@ -110,10 +113,19 @@ def generate_batch(
     No_grad is load-bearing, not hygiene: with a trainable layer-0 adapter,
     grad-mode decode retains every step's full KV-cache via grad_fn (the
     v16a step-0 OOM).
+
+    When supplied, streamer receives each generated token (including EOS) as
+    a CPU tensor via put(), followed by end(). Streaming supports one input;
+    no prompt tokens are emitted and the default path adds no transfers.
     """
+    if streamer is not None and len(prompt_ids_list) != 1:
+        raise ValueError("Token streaming requires exactly one input")
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be positive")
     inner = model.model
     device = next(model.parameters()).device
     n_layers = len(inner.layers)
+    full_attn_layers = set(get_full_attn_layer_indices(model))
 
     with _Timer() as t_pf:
         first_toks, cache, kept_pos_b, n_kepts, K_clampeds = prefill_batch_for_decode(
@@ -122,6 +134,8 @@ def generate_batch(
             prune_below_gate=prune_below_gate,
         )
     B = first_toks.shape[0]
+    if streamer is not None:
+        streamer.put(first_toks.detach().cpu())
     last_valid = torch.tensor([n - 1 for n in n_kepts], device=device)
     next_pos = (kept_pos_b[torch.arange(B), last_valid] + 1).unsqueeze(1).to(device)
     cache_next = kept_pos_b.shape[1]
@@ -194,22 +208,22 @@ def generate_batch(
                 if not prune_below_gate and li <= gate_layer:
                     # full phase-1 cache at this layer: full-width pad mask +
                     # its own append slot (the form fold never covers <= L)
-                    hs = inner.layers[li](
-                        hs, attention_mask=bm.to(hd),
-                        position_ids=next_pos.to(hd),
-                        past_key_values=cache, use_cache=True,
-                        cache_position=cp_below, position_embeddings=pe,
-                    )
-                    continue
-                am = fds.mask_for(li, cache_next + 1) if fds is not None else dm
+                    am, layer_cp = bm, cp_below
+                else:
+                    am = fds.mask_for(li, cache_next + 1) if fds is not None else dm
+                    layer_cp = cp
+                # Recurrent layers consume one unpadded token, not a KV mask.
+                mask = am.to(hd) if li in full_attn_layers else None
                 hs = inner.layers[li](
-                    hs, attention_mask=am.to(hd),
+                    hs, attention_mask=mask,
                     position_ids=next_pos.to(hd),
                     past_key_values=cache, use_cache=True,
-                    cache_position=cp, position_embeddings=pe,
+                    cache_position=layer_cp, position_embeddings=pe,
                 )
             hs = inner.norm(hs)
             nt = model.lm_head(hs)[:, -1].argmax(-1, keepdim=True).to(device)
+            if streamer is not None:
+                streamer.put(nt.detach().cpu())
             for b in range(B):
                 all_gen[b].append(nt[b:b + 1])
             cur = nt
@@ -218,18 +232,26 @@ def generate_batch(
             steps += 1
     if fds is not None:
         fds.finish()
+    if streamer is not None:
+        streamer.end()
 
     answers: List[str] = []
     n_gen: List[int] = []
+    token_ids: List[List[int]] = []
     for b in range(B):
         glist = torch.cat(all_gen[b], dim=1)[0].cpu().tolist()
         # Cut at the FIRST EOS: batched decode runs until ALL rows hit EOS and
         # appends every step's token to every row, so an early-finishing row
         # looks like [..., answer, EOS, junk, junk, ...].
         if tokenizer.eos_token_id in glist:
-            glist = glist[:glist.index(tokenizer.eos_token_id)]
+            end = glist.index(tokenizer.eos_token_id)
+            token_ids.append(glist[:end + 1])
+            glist = glist[:end]
+        else:
+            token_ids.append(glist)
         n_gen.append(len(glist))
         answers.append(_strip_thinking(
             tokenizer.decode(glist, skip_special_tokens=True)) if glist else "")
     return GateDecodeResult(answers, n_gen, list(n_kepts), kept_pos_b,
-                            list(K_clampeds), t_pf.elapsed, t_dec.elapsed, steps)
+                            list(K_clampeds), t_pf.elapsed, t_dec.elapsed, steps,
+                            token_ids)

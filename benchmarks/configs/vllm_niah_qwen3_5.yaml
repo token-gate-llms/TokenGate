@@ -1,0 +1,15 @@
+# Public Qwen3.5 release with its gate after layer 3.
+name: Qwen3.5-2B
+base_model: Qwen/Qwen3.5-2B
+base_revision: 15852e8c16360a2fea060d615a32b45270f8a8fc
+checkpoint: liana313/tokengate-niah-qwen3.5-2b
+checkpoint_revision: 6b3222b86fe4f5cbf045aad5c5dedfa89eb294b0
+gate_file: gate_step1800.pt
+adapter_file: lora_step1800.pt
+gate_layer: 3
+task: niah_kamradt
+samples: examples/data/niah_32k_samples.jsonl
+k_values: [64, 512, 2048, 4096, 8192]
+max_new_tokens: 64
+gate_attn: fa2
+engines: [original, vllm, vllm_base, vllm_base_triton, vllm_adapter, vllm_adapter_triton]
