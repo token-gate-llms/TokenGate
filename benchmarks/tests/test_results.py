@@ -93,3 +93,31 @@ def test_committed_needle_examples_use_existing_task_prompt():
     assert prompt.index(original["question"]) < prompt.index(
         original["body"].lstrip("\n")
     )
+
+
+def test_tiled_results_require_every_pruning_budget(tmp_path):
+    from runpy import run_path
+
+    load_results = run_path("examples/inference-vllm-helper.py")["load_results"]
+    (tmp_path / "inputs.json").write_text(
+        json.dumps({"config": {"budgets": [64, 512, "All"]}, "samples": [{"id": "a"}]})
+    )
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"engines": ["vllm_tiled"], "repeats": 1})
+    )
+    (tmp_path / "validation.json").write_text(
+        json.dumps({"status": "behavior_checked"})
+    )
+    measurements = tmp_path / "measurements.jsonl"
+    measurements.write_text(json.dumps(row(engine="vllm_tiled", budget="All")) + "\n")
+    with pytest.raises(ValueError, match="coverage"):
+        load_results([tmp_path])
+    measurements.write_text(
+        "".join(
+            json.dumps(row(engine="vllm_tiled", budget=k)) + "\n"
+            for k in [64, 512, "All"]
+        )
+    )
+    table, qualified = load_results([tmp_path])
+    assert len(table) == 3
+    assert not qualified

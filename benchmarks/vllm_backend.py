@@ -116,7 +116,7 @@ def run_vllm(
         raise ValueError(
             "Installed vLLM is not the --vllm-source checkout; install it editable"
         )
-    gated = variant == "vllm"
+    gated = variant in ("vllm", "vllm_tiled")
     model = (
         Path(inputs["base"])
         if variant.startswith("vllm_base")
@@ -150,7 +150,10 @@ def run_vllm(
             mamba_cache_mode="none",
             gpu_memory_utilization=0.8,
             attention_config={
-                "backend": "TRITON_ATTN" if variant.endswith("_triton") else None
+                "backend": "TRITON_ATTN" if variant.endswith("_triton") else None,
+                "token_gate_prefill_backend": (
+                    "tiled" if variant == "vllm_tiled" else "triton"
+                ),
             },
             profiler_config=profiler,
         )

@@ -26,7 +26,11 @@ def load_results(directories: list[Path]):
     """
     import pandas as pd
 
-    from benchmarks.run_vllm_benchmark import summarize, validate_rows
+    from benchmarks.run_vllm_benchmark import (
+        TOKEN_GATE_ENGINES,
+        summarize,
+        validate_rows,
+    )
 
     rows, qualified = [], True
     for directory in directories:
@@ -42,9 +46,7 @@ def load_results(directories: list[Path]):
         ]
         for engine in manifest["engines"]:
             budgets = (
-                inputs["config"]["budgets"]
-                if engine in ("original", "vllm")
-                else ["All"]
+                inputs["config"]["budgets"] if engine in TOKEN_GATE_ENGINES else ["All"]
             )
             validate_rows(
                 [r for r in measurements if r["engine"] == engine],
@@ -75,10 +77,10 @@ def plot_comparison(table, output: Path):
     import seaborn as sns
     from matplotlib.lines import Line2D
 
-    from benchmarks.run_vllm_benchmark import LABELS
+    from benchmarks.run_vllm_benchmark import LABELS, TOKEN_GATE_ENGINES
 
     data = table[
-        table.engine.isin(["original", "vllm"])
+        table.engine.isin(TOKEN_GATE_ENGINES)
         | (
             table.engine.isin(["vllm_base", "vllm_base_triton"])
             & table.budget.eq("All")
@@ -114,6 +116,7 @@ def plot_comparison(table, output: Path):
     )
     palette[LABELS["vllm_base"]] = "#a6a6a6"
     palette[LABELS["vllm_base_triton"]] = "#a6a6a6"
+    palette[LABELS["vllm_tiled"]] = "#FFD700"
     with (
         sns.axes_style("whitegrid"),
         plt.rc_context(
@@ -129,7 +132,7 @@ def plot_comparison(table, output: Path):
             }
         ),
     ):
-        fig, axes = plt.subplots(1, 2, figsize=(13.5, 4.8), layout="constrained")
+        fig, axes = plt.subplots(1, 2, figsize=(18, 5.2), layout="constrained")
         for ax, metric, title, label in zip(
             axes,
             ["ttft_ms", "final_ms"],
@@ -173,7 +176,10 @@ def plot_comparison(table, output: Path):
             for container, implementation in zip(
                 ax.containers, implementations, strict=True
             ):
-                if implementation == LABELS["vllm_base_triton"]:
+                if implementation in (
+                    LABELS["vllm_base_triton"],
+                    LABELS["vllm_tiled"],
+                ):
                     for bar in container.patches:
                         bar.set_hatch("xx")
                         bar.set_edgecolor("black")
@@ -185,6 +191,16 @@ def plot_comparison(table, output: Path):
                     .dropna(subset=[metric])
                 )
                 for bar, row in zip(container.patches, rows.itertuples(), strict=True):
+                    present = data.loc[
+                        data.Configuration == row.Index, "Implementation"
+                    ].tolist()
+                    present.sort(key=implementations.index)
+                    center = (
+                        categories.index(row.Index)
+                        + (present.index(implementation) - (len(present) - 1) / 2)
+                        * bar.get_width()
+                    )
+                    bar.set_x(center - bar.get_width() / 2)
                     latency = getattr(row, metric)
                     speedup = (
                         f"{baselines[row.model] / latency:.1f}×"

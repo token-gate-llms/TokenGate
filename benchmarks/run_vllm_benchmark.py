@@ -28,13 +28,15 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 LABELS = {
     "original": "Original TokenGate",
-    "vllm": "TokenGate in vLLM",
+    "vllm": "TokenGate in vLLM (Triton)",
+    "vllm_tiled": "TokenGate in vLLM (tiled prefill)",
     "base": "Qwen in Transformers",
     "vllm_base": "Base Qwen in vLLM (auto)",
     "vllm_base_triton": "Base Qwen in vLLM (Triton)",
     "vllm_adapter": "Qwen + LoRA in vLLM (auto)",
     "vllm_adapter_triton": "Qwen + LoRA in vLLM (Triton)",
 }
+TOKEN_GATE_ENGINES = ("original", "vllm", "vllm_tiled")
 
 
 def file_hash(path: Path) -> str:
@@ -531,7 +533,7 @@ def worker(args) -> None:
 
     inputs = json.loads(args.worker.read_text())
     engine = args.engines[0]
-    budgets = inputs["config"]["budgets"] if engine in ("original", "vllm") else ["All"]
+    budgets = inputs["config"]["budgets"] if engine in TOKEN_GATE_ENGINES else ["All"]
     profile = args.output.parent / "profiles" / engine if args.profile else None
     if engine.startswith("vllm"):
         from benchmarks.vllm_backend import run_vllm
@@ -776,6 +778,13 @@ def main() -> None:
             if {"original", "vllm"} <= set(engines)
             else None,
             "numerical_qualification": "not_run",
+            "kernel_token_agreement": all(
+                pair["vllm"] == pair["vllm_tiled"]
+                for pair in by_case.values()
+                if {"vllm", "vllm_tiled"} <= pair.keys()
+            )
+            if {"vllm", "vllm_tiled"} <= set(engines)
+            else None,
             "qualified_speedups": False,
         },
     )
