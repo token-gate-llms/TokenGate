@@ -165,3 +165,94 @@ def test_prepared_configs_select_only_reserved_ids(
     assert len(ids) == 184 and not set(ids) & set(partitions["val"])
     with pytest.raises(FileExistsError):
         helpers["prepare_niah_configs"](launch["configs"], samples, launch["output"])
+
+
+def test_remote_runtime_pins_source_and_isolates_imports(
+    helpers, tmp_path, monkeypatch
+):
+    """Use real Git and a real venv, substituting only the dependency download."""
+    remote = tmp_path / "remote"
+    remote.mkdir()
+    subprocess.run(["git", "init", "-b", "test-branch", str(remote)], check=True)
+    package = remote / "vllm"
+    (package / "v1/attention/ops").mkdir(parents=True)
+    (package / "__init__.py").write_text("REVISION = 'published'\n")
+    (package / "v1/attention/ops/token_gate_attention.py").write_text(
+        "def token_gate_prefill(): pass\n"
+    )
+    subprocess.run(["git", "-C", str(remote), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(remote),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-m",
+            "Published code",
+        ],
+        check=True,
+    )
+    revision = subprocess.check_output(
+        ["git", "-C", str(remote), "rev-parse", "HEAD"], text=True
+    ).strip()
+    # These working-tree changes must never reach a clone of the published commit.
+    (package / "__init__.py").write_text(
+        "raise RuntimeError('Local source was used')\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(remote))
+    monkeypatch.setattr(sys, "platform", "linux")
+    state = helpers["prepare_vllm_runtime"].__globals__
+    actual_run = state["_run_logged"]
+    monkeypatch.setattr(state["shutil"], "which", lambda name: name)
+    workspace = tmp_path / "temporary"
+    workspace.mkdir()
+    monkeypatch.setattr(state["tempfile"], "mkdtemp", lambda **kw: str(workspace))
+
+    def run(command, log, description, **kwargs):
+        if command[:2] == ["uv", "venv"]:
+            # The real isolated interpreter has no access to the test process's packages.
+            subprocess.run(
+                [sys.executable, "-m", "venv", "--without-pip", command[-1]], check=True
+            )
+        elif command[:3] == ["uv", "pip", "install"]:
+            python = command[command.index("--python") + 1]
+            site = subprocess.check_output(
+                [
+                    python,
+                    "-c",
+                    "import sysconfig; print(sysconfig.get_path('purelib'))",
+                ],
+                text=True,
+            ).strip()
+            Path(site, "fixture.pth").write_text(str(workspace / "vllm") + "\n")
+            assert kwargs["env"]["VLLM_USE_PRECOMPILED"] == "1"
+            assert "PYTHONPATH" not in kwargs["env"]
+        else:
+            actual_run(command, log, description, **kwargs)
+
+    monkeypatch.setitem(state, "_run_logged", run)
+    runtime = helpers["prepare_vllm_runtime"](str(remote), "test-branch", revision)
+    source = runtime["vllm_source"]
+    assert source != remote
+    assert (
+        subprocess.check_output(
+            ["git", "-C", str(source), "rev-parse", "HEAD"], text=True
+        ).strip()
+        == revision
+    )
+    assert (source / "vllm/__init__.py").read_text() == "REVISION = 'published'\n"
+    assert str(source / "vllm/__init__.py") in (workspace / "verify.log").read_text()
+    assert (
+        "include-system-site-packages = false"
+        in (workspace / "venv/pyvenv.cfg").read_text()
+    )
+
+
+def test_remote_runtime_rejects_unpinned_revision(helpers, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "linux")
+    with pytest.raises(ValueError, match="full lowercase Git commit SHA"):
+        helpers["prepare_vllm_runtime"]("https://example.com/repo.git", "main", "main")

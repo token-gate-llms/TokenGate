@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from itertools import pairwise
 from pathlib import Path
 
@@ -45,6 +47,115 @@ def saved_run_paths(variable: str) -> list[Path]:
     if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
         raise ValueError(f"{variable} must be a JSON list of directory paths")
     return [Path(path).expanduser().resolve() for path in paths]
+
+
+def prepare_vllm_runtime(repository: str, branch: str, revision: str) -> dict:
+    """Download a published vLLM revision and install it in an isolated environment.
+
+    The checkout, virtual environment, and setup logs live in a new system
+    temporary directory. No existing vLLM installation or checkout is reused.
+    The directory remains available for worker processes and failure inspection.
+    Uses vLLM's precompiled editable-install workflow for native extensions;
+    the fork's Python and Triton kernels come from the requested Git revision.
+
+    Args:
+        repository: HTTPS URL of the public vLLM fork.
+        branch: Published branch containing the requested revision.
+        revision: Full Git commit SHA to pin for this notebook run.
+
+    Returns:
+        vllm_source and vllm_python arguments for run_benchmarks.
+
+    Raises:
+        RuntimeError: The platform, tools, checkout, or installation is unsuitable.
+        ValueError: The revision is not a full SHA or is absent from the branch.
+    """
+    if sys.platform != "linux":
+        raise RuntimeError("New inference runs require Linux with an NVIDIA GPU")
+    if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision):
+        raise ValueError("Pin VLLM_REVISION to a full lowercase Git commit SHA")
+    uv = shutil.which("uv")
+    if uv is None or shutil.which("git") is None:
+        raise RuntimeError("Install uv and Git before running notebook setup")
+    workspace = Path(tempfile.mkdtemp(prefix="tokengate-vllm-"))
+    source, environment = workspace / "vllm", workspace / "venv"
+    python = environment / "bin/python"
+    console.print(f"Download vLLM {branch} at {revision[:12]} into {workspace}")
+    _run_logged(
+        [
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--single-branch",
+            "--branch",
+            branch,
+            repository,
+            str(source),
+        ],
+        workspace / "clone.log",
+        "Download the published vLLM fork",
+    )
+    ancestry = subprocess.run(
+        ["git", "-C", str(source), "merge-base", "--is-ancestor", revision, "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ancestry.returncode:
+        raise ValueError(f"Commit {revision} is not available on {branch}")
+    _run_logged(
+        ["git", "-C", str(source), "checkout", "--detach", revision],
+        workspace / "revision.log",
+        "Pin the vLLM revision",
+    )
+    _run_logged(
+        [uv, "venv", "--python", sys.executable, str(environment)],
+        workspace / "environment.log",
+        "Create the vLLM environment",
+    )
+    env = dict(os.environ, VLLM_USE_PRECOMPILED="1", PYTHONNOUSERSITE="1")
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "VLLM_PRECOMPILED_WHEEL_LOCATION",
+        "VLLM_PRECOMPILED_WHEEL_COMMIT",
+    ):
+        env.pop(key, None)
+    _run_logged(
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "--torch-backend=auto",
+            "--editable",
+            str(source),
+            "--editable",
+            f"{ROOT}[benchmark]",
+        ],
+        workspace / "install.log",
+        "Install vLLM and benchmark dependencies",
+        env=env,
+    )
+    _run_logged(
+        [
+            str(python),
+            "-c",
+            (
+                "import sys; from pathlib import Path; import vllm; "
+                "from vllm.v1.attention.ops.token_gate_attention import token_gate_prefill; "
+                "assert Path(vllm.__file__).resolve().is_relative_to(Path(sys.argv[1])); "
+                "print(vllm.__file__)"
+            ),
+            str(source),
+        ],
+        workspace / "verify.log",
+        "Verify the downloaded TokenGate implementation",
+        env=env,
+    )
+    console.print(f"vLLM ready: {revision[:12]} in {environment}")
+    return {"vllm_source": source, "vllm_python": str(python)}
 
 
 def show_hardware(saved_runs: list[Path], gpu: str) -> None:
@@ -142,7 +253,7 @@ def run_benchmarks(
     *,
     saved_runs: list[Path],
     engines: list[str],
-    vllm_source: Path,
+    vllm_source: Path | None = None,
     gpu: str,
     warmups: int,
     repeats: int,
@@ -151,6 +262,7 @@ def run_benchmarks(
     profile: bool = False,
     original_python: str = sys.executable,
     vllm_python: str = sys.executable,
+    cache: Path | None = None,
 ) -> list[Path]:
     """Reuse saved measurements or launch each model through the benchmark CLI.
 
@@ -168,6 +280,7 @@ def run_benchmarks(
         profile: Whether to collect an additional, untimed trace.
         original_python: Python executable for the runner and original worker.
         vllm_python: Python executable for the vLLM worker.
+        cache: Model export cache; defaults to tokengate-benchmark under XDG_CACHE_HOME.
 
     Returns:
         Directories containing the recorded measurements and their manifests.
@@ -186,8 +299,11 @@ def run_benchmarks(
             )
         console.print("Using saved measurements; inference will not run again.")
         return list(saved_runs)
-    if not (vllm_source / "tools/export_token_gate.py").is_file():
-        raise FileNotFoundError("Set VLLM_SOURCE to the TokenGate vLLM checkout")
+    if (
+        vllm_source is None
+        or not (vllm_source / "tools/export_token_gate.py").is_file()
+    ):
+        raise FileNotFoundError("Run prepare_vllm_runtime before starting inference")
     runs = [output / config.stem for config in configs]
     if len(runs) != len(set(runs)):
         raise ValueError("Configuration filenames must have distinct stems")
@@ -195,6 +311,11 @@ def run_benchmarks(
         if run.exists():
             raise FileExistsError(f"Choose a new output directory: {run}")
     output.mkdir(parents=True, exist_ok=True)
+    if cache is None:
+        cache = (
+            Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+            / "tokengate-benchmark"
+        )
     for config, run in zip(configs, runs, strict=True):
         console.rule(f"Run {yaml.safe_load(config.read_text())['name']}")
         command = [
@@ -219,6 +340,8 @@ def run_benchmarks(
             vllm_python,
             "--vllm-source",
             str(vllm_source),
+            "--cache",
+            str(cache),
             "--engines",
             *engines,
         ]
