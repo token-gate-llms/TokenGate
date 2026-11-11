@@ -519,7 +519,7 @@ def train_demo_sft_baseline(base_model: str, data_root: str | Path,
     subprocess.run([
         sys.executable, "-m", "torch.distributed.run",
         f"--nproc_per_node={num_gpus}", "--master_port=29501",
-        "-m", "tokengate.demo_baseline", "--base-model", base_model,
+        str(Path(__file__).with_name("train_lora_baseline.py")), "--base-model", base_model,
         "--data-root", str(data_root), "--eval-split", str(eval_split),
         "--output-dir", str(output_dir), "--max-steps", str(steps),
         "--grad-accum", str(4 // num_gpus),
