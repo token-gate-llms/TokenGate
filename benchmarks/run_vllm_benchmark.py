@@ -19,11 +19,20 @@ import subprocess
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+from benchmarks.batching import (
+    BatchTokenCollector,
+    BatchingConfig,
+    mean_interval,
+    quantile,
+    run_record,
+    validate_runs,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LABELS = {
@@ -101,6 +110,7 @@ def hardware_info() -> dict:
         "vllm",
         "flash-attn",
         "flash-linear-attention",
+        "causal-conv1d",
     ):
         try:
             info["packages"][name] = importlib.metadata.version(name)
@@ -318,6 +328,8 @@ def original_runs(
     *,
     base_only: bool = False,
     profile: Path | None = None,
+    batching: BatchingConfig = BatchingConfig(),
+    runs: list[dict] | None = None,
 ) -> list[dict]:
     """Measure the public TokenGate API (or the existing unmodified-base arm)."""
     import torch
@@ -349,86 +361,95 @@ def original_runs(
         model = load_model(
             inputs["gate"], base_model=inputs["base"], gate_attn=cfg["gate_attn"]
         )
-    rows = []
-    for budget in budgets:
-        for sample in inputs["samples"]:
-            start, end = sample["span_start"], sample["span_end"]
-            ids = sample["input_ids"]
-            k = end - start if budget == "All" else budget
-            marked = (
-                ids[:start]
-                + [STATE_START_ID]
-                + ids[start:end]
-                + [STATE_END_ID]
-                + ids[end:]
+    if batching.mode != "sequential":
+        if batching.mode != "static" or base_only:
+            raise ValueError(
+                "The original implementation supports static TokenGate batching only"
             )
-            if not base_only:
-                plain = model.generate(
-                    marked,
-                    tokenizer,
-                    max_kept_prefill_tokens=k,
-                    max_new_tokens=cfg["max_new_tokens"],
+        rows = original_batches(
+            model, tokenizer, inputs, budgets, warmups, repeats, batching, runs
+        )
+    else:
+        rows = []
+        for budget in budgets:
+            for sample in inputs["samples"]:
+                start, end = sample["span_start"], sample["span_end"]
+                ids = sample["input_ids"]
+                k = end - start if budget == "All" else budget
+                marked = (
+                    ids[:start]
+                    + [STATE_START_ID]
+                    + ids[start:end]
+                    + [STATE_END_ID]
+                    + ids[end:]
                 )
-            for repeat in range(-warmups, repeats):
-                collector = TokenCollector(skip_prompt=base_only)
-                tensor = torch.tensor([ids], device="cuda") if base_only else None
-                torch.cuda.synchronize()
-                submitted = time.perf_counter()
-                if base_only:
-                    model.generate(
-                        tensor,
-                        do_sample=False,
-                        max_new_tokens=cfg["max_new_tokens"],
-                        eos_token_id=tokenizer.eos_token_id,
-                        streamer=collector,
-                    )
-                    result = None
-                else:
-                    result = model.generate(
+                if not base_only:
+                    plain = model.generate(
                         marked,
                         tokenizer,
                         max_kept_prefill_tokens=k,
                         max_new_tokens=cfg["max_new_tokens"],
-                        streamer=collector,
                     )
-                completed = time.perf_counter()
-                if not collector.ended or not collector.tokens:
-                    raise ValueError(
-                        "Generation did not deliver a complete token stream"
-                    )
-                if result is not None:
-                    from tokengate.generators import _strip_thinking
-
-                    streamed_answer = _strip_thinking(
-                        tokenizer.decode(collector.tokens, skip_special_tokens=True)
-                    )
-                    if (
-                        collector.tokens != plain.token_ids[0]
-                        or result.token_ids != plain.token_ids
-                        or result.answers != plain.answers
-                        or result.kept_pos != plain.kept_pos
-                        or streamed_answer != plain.answers[0]
-                    ):
+                for repeat in range(-warmups, repeats):
+                    collector = TokenCollector(skip_prompt=base_only)
+                    tensor = torch.tensor([ids], device="cuda") if base_only else None
+                    torch.cuda.synchronize()
+                    submitted = time.perf_counter()
+                    if base_only:
+                        model.generate(
+                            tensor,
+                            do_sample=False,
+                            max_new_tokens=cfg["max_new_tokens"],
+                            eos_token_id=tokenizer.eos_token_id,
+                            streamer=collector,
+                        )
+                        result = None
+                    else:
+                        result = model.generate(
+                            marked,
+                            tokenizer,
+                            max_kept_prefill_tokens=k,
+                            max_new_tokens=cfg["max_new_tokens"],
+                            streamer=collector,
+                        )
+                    completed = time.perf_counter()
+                    if not collector.ended or not collector.tokens:
                         raise ValueError(
-                            "Streaming changed generation or retained positions"
+                            "Generation did not deliver a complete token stream"
                         )
-                if repeat >= 0:
-                    rows.append(
-                        dict(
-                            id=sample["id"],
-                            budget=budget,
-                            repeat=repeat,
-                            token_ids=collector.tokens,
-                            ttft_s=collector.arrival[0] - submitted,
-                            final_s=collector.arrival[-1] - submitted,
-                            wall_s=completed - submitted,
-                            prefill_s=result.prefill_s if result else None,
-                            decode_s=result.decode_s if result else None,
-                            kept_positions=result.kept_pos[0]
-                            if result
-                            else list(range(len(ids))),
+                    if result is not None:
+                        from tokengate.generators import _strip_thinking
+
+                        streamed_answer = _strip_thinking(
+                            tokenizer.decode(collector.tokens, skip_special_tokens=True)
                         )
-                    )
+                        if (
+                            collector.tokens != plain.token_ids[0]
+                            or result.token_ids != plain.token_ids
+                            or result.answers != plain.answers
+                            or result.kept_pos != plain.kept_pos
+                            or streamed_answer != plain.answers[0]
+                        ):
+                            raise ValueError(
+                                "Streaming changed generation or retained positions"
+                            )
+                    if repeat >= 0:
+                        rows.append(
+                            dict(
+                                id=sample["id"],
+                                budget=budget,
+                                repeat=repeat,
+                                token_ids=collector.tokens,
+                                ttft_s=collector.arrival[0] - submitted,
+                                final_s=collector.arrival[-1] - submitted,
+                                wall_s=completed - submitted,
+                                prefill_s=result.prefill_s if result else None,
+                                decode_s=result.decode_s if result else None,
+                                kept_positions=result.kept_pos[0]
+                                if result
+                                else list(range(len(ids))),
+                            )
+                        )
     if profile is not None:
         profile.mkdir(parents=True, exist_ok=True)
         sample = inputs["samples"][0]
@@ -461,6 +482,122 @@ def original_runs(
     return rows
 
 
+def original_batches(model, tokenizer, inputs, budgets, warmups, repeats, config, runs):
+    """Measure the existing batched public API and verify its streamed token rows."""
+    import torch
+    from tokengate import STATE_END_ID, STATE_START_ID
+
+    prepared = {}
+    for sample in inputs["samples"]:
+        ids, lo, hi = sample["input_ids"], sample["span_start"], sample["span_end"]
+        prepared[sample["id"]] = (
+            ids[:lo] + [STATE_START_ID] + ids[lo:hi] + [STATE_END_ID] + ids[hi:]
+        )
+    rows = []
+    for budget in budgets:
+        for repeat in range(-warmups, repeats):
+            batches = list(config.batches(inputs["samples"], repeat))
+            options = dict(
+                max_kept_prefill_tokens=None if budget == "All" else budget,
+                max_new_tokens=inputs["config"]["max_new_tokens"],
+            )
+            # Untimed comparison also warms each padded batch shape.
+            plain = [
+                model.generate([prepared[s["id"]] for s in group], tokenizer, **options)
+                for group in batches
+            ]
+            measured = []
+            torch.cuda.reset_peak_memory_stats()
+            started = time.perf_counter()
+            for batch_id, (group, expected) in enumerate(
+                zip(batches, plain, strict=True)
+            ):
+                prompts = [prepared[s["id"]] for s in group]
+                collector = BatchTokenCollector(len(group), inputs["eos_token_id"])
+                torch.cuda.synchronize()
+                submitted = time.perf_counter()
+                try:
+                    result = model.generate(
+                        prompts, tokenizer, streamer=collector, **options
+                    )
+                    returned = time.perf_counter()
+                    if not collector.ended or collector.tokens != result.token_ids:
+                        raise ValueError(
+                            "Stream differs from the returned batched tokens"
+                        )
+                    if (
+                        result.token_ids != expected.token_ids
+                        or result.answers != expected.answers
+                        or result.kept_pos != expected.kept_pos
+                    ):
+                        raise ValueError("Streaming changed batched generation")
+                except Exception as exc:
+                    returned = time.perf_counter()
+                    measured.extend(
+                        dict(
+                            id=s["id"],
+                            token_ids=[],
+                            returned_s=returned,
+                            error=f"{type(exc).__name__}: {exc}",
+                            budget=budget,
+                            repeat=repeat,
+                            batch_id=batch_id,
+                        )
+                        for s in group
+                    )
+                    break
+                for i, sample in enumerate(group):
+                    arrivals = collector.arrivals[i]
+                    measured.append(
+                        dict(
+                            id=sample["id"],
+                            budget=budget,
+                            repeat=repeat,
+                            batch_id=batch_id,
+                            batch_size=len(group),
+                            request_id=f"{budget}-{repeat}-{sample['id']}",
+                            token_ids=collector.tokens[i],
+                            input_tokens=len(sample["input_ids"]),
+                            token_arrivals_s=arrivals,
+                            submitted_s=submitted,
+                            first_token_s=arrivals[0],
+                            final_token_s=arrivals[-1],
+                            returned_s=returned,
+                            ttft_s=arrivals[0] - submitted,
+                            final_s=arrivals[-1] - submitted,
+                            wall_s=returned - submitted,
+                            prefill_s=result.prefill_s,
+                            decode_s=result.decode_s,
+                            kept_positions=result.kept_pos[i],
+                        )
+                    )
+            ended = time.perf_counter()
+            if repeat >= 0:
+                rows.extend(measured)
+                if runs is not None:
+                    record = run_record(
+                        measured,
+                        started,
+                        ended,
+                        budget=budget,
+                        repeat=repeat,
+                        config=config,
+                    )
+                    record["memory"] = [
+                        dict(
+                            peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                            allocated_bytes=torch.cuda.memory_allocated(),
+                            reserved_kv_bytes=None,
+                        )
+                    ]
+                    runs.append(record)
+            if any(row.get("error") for row in measured):
+                if repeat < 0:
+                    raise RuntimeError(f"Warmup failed: {measured}")
+                return rows
+    return rows
+
+
 def validate_rows(rows: list[dict], inputs: dict, budgets: list, repeats: int) -> None:
     """Reject incomplete runs, duplicate measurements, and invalid timing records."""
     expected = {
@@ -483,8 +620,8 @@ def validate_rows(rows: list[dict], inputs: dict, budgets: list, repeats: int) -
             raise ValueError("Inconsistent latency boundaries")
 
 
-def summarize(rows: list[dict]) -> list[dict]:
-    """Aggregate accuracy over examples and sequential throughput over request walls."""
+def summarize(rows: list[dict], runs: list[dict] | None = None) -> list[dict]:
+    """Aggregate unique-example accuracy and throughput over recorded run windows."""
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["model"], row["engine"], str(row["budget"]))].append(row)
@@ -499,7 +636,26 @@ def summarize(rows: list[dict]) -> list[dict]:
         # A nondeterministic example is not counted as correct by choosing its best repeat.
         correct = sum(all(r["correct"] for r in rs) for rs in examples.values())
         score = statistics.mean(min(r["score"] for r in rs) for rs in examples.values())
-        wall = sum(r["wall_s"] for r in measurements)
+        windows = [
+            r
+            for r in (runs or [])
+            if (r["model"], r["engine"], str(r["budget"])) == (model, engine, budget)
+        ]
+        if any(not r["valid"] for r in windows):
+            raise ValueError("Failed runs cannot be summarized as completed results")
+        wall = (
+            sum(r["elapsed_s"] for r in windows)
+            if windows
+            else sum(r["wall_s"] for r in measurements)
+        )
+        completed = (
+            sum(r["completed"] for r in windows) if windows else len(measurements)
+        )
+        output_tokens = (
+            sum(r["output_tokens"] for r in windows)
+            if windows
+            else sum(len(r["token_ids"]) for r in measurements)
+        )
         result.append(
             dict(
                 model=model,
@@ -515,9 +671,26 @@ def summarize(rows: list[dict]) -> list[dict]:
                 output_tokens=statistics.median(
                     len(r["token_ids"]) for r in measurements
                 ),
-                requests_per_s=len(measurements) / wall,
-                output_tokens_per_s=sum(len(r["token_ids"]) for r in measurements)
-                / wall,
+                requests_per_s=completed / wall,
+                output_tokens_per_s=output_tokens / wall,
+                ttft_p95_ms=1000 * quantile([r["ttft_s"] for r in measurements], 0.95),
+                final_p95_ms=1000
+                * quantile([r["final_s"] for r in measurements], 0.95),
+                run_statistics={
+                    metric: mean_interval([r[metric] for r in windows])
+                    for metric in (
+                        "requests_per_s",
+                        "output_tokens_per_s",
+                        "ttft_median_ms",
+                        "ttft_p95_ms",
+                        "final_median_ms",
+                        "final_p95_ms",
+                    )
+                    if windows and all(r[metric] is not None for r in windows)
+                },
+                accuracy_source="repeated_load"
+                if any(r["duration_s"] for r in windows)
+                else "finite_pass",
                 numerical_qualification="not_run",
             )
         )
@@ -535,6 +708,16 @@ def worker(args) -> None:
     engine = args.engines[0]
     budgets = inputs["config"]["budgets"] if engine in TOKEN_GATE_ENGINES else ["All"]
     profile = args.output.parent / "profiles" / engine if args.profile else None
+    batching = BatchingConfig(
+        mode=args.mode,
+        size=args.batch_size,
+        token_budget=args.max_batched_tokens,
+        duration_s=args.duration,
+        seed=args.seed,
+        base_settings=args.base_settings,
+        ramp_up_s=args.ramp_up,
+    )
+    runs, runtime = [], {}
     if engine.startswith("vllm"):
         from benchmarks.vllm_backend import run_vllm
 
@@ -547,6 +730,9 @@ def worker(args) -> None:
             args.cache,
             variant=engine,
             profile=profile,
+            batching=batching,
+            runs=runs,
+            metadata=runtime,
         )
     else:
         rows = original_runs(
@@ -556,8 +742,19 @@ def worker(args) -> None:
             args.repeats,
             base_only=engine == "base",
             profile=profile,
+            batching=batching,
+            runs=runs,
         )
-    validate_rows(rows, inputs, budgets, args.repeats)
+    write_json(
+        args.output,
+        {"rows": rows, "runs": runs, "runtime": runtime, "hardware": hardware_info()},
+    )
+    if any(row.get("error") for row in rows):
+        raise RuntimeError("Request failures preserved in the worker result")
+    if not batching.duration_s:
+        validate_rows(rows, inputs, budgets, args.repeats)
+    if batching.mode != "sequential":
+        validate_runs(rows, runs, inputs, budgets, args.repeats, batching)
     tokenizer = AutoTokenizer.from_pretrained(inputs["base"], local_files_only=True)
     task = get_task(inputs["config"]["task"])
     targets = {s["id"]: s["target"] for s in inputs["samples"]}
@@ -577,7 +774,10 @@ def worker(args) -> None:
                 and row["token_ids"][-1] != inputs["eos_token_id"]
             ),
         )
-    write_json(args.output, {"rows": rows, "hardware": hardware_info()})
+    write_json(
+        args.output,
+        {"rows": rows, "runs": runs, "runtime": runtime, "hardware": hardware_info()},
+    )
 
 
 def main() -> None:
@@ -602,8 +802,46 @@ def main() -> None:
     )
     parser.add_argument("--original-python", default=sys.executable)
     parser.add_argument("--vllm-python", default=sys.executable)
+    parser.add_argument(
+        "--mode", choices=["sequential", "static", "continuous"], default="sequential"
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Static batch size or continuous client concurrency",
+    )
+    parser.add_argument("--max-batched-tokens", type=int)
+    parser.add_argument(
+        "--duration",
+        type=float,
+        default=0,
+        help="Continuous-load window in seconds; zero visits each sample once",
+    )
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--ramp-up",
+        type=float,
+        default=5.0,
+        help="Untimed ramp-up seconds before a sustained load window",
+    )
+    parser.add_argument(
+        "--base-settings", choices=["matched", "normal"], default="matched"
+    )
     parser.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    try:
+        batching = BatchingConfig(
+            mode=args.mode,
+            size=args.batch_size,
+            token_budget=args.max_batched_tokens,
+            duration_s=args.duration,
+            seed=args.seed,
+            base_settings=args.base_settings,
+            ramp_up_s=args.ramp_up,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.warmups < 0 or args.repeats < 1:
         parser.error("warmups must be nonnegative and repeats positive")
     if args.worker:
@@ -629,6 +867,14 @@ def main() -> None:
         parser.error("configuration contains an unknown implementation")
     if any(e.startswith("vllm") for e in engines) and args.vllm_source is None:
         parser.error("--vllm-source is required for the vLLM exporter")
+    if batching.mode == "continuous" and any(not e.startswith("vllm") for e in engines):
+        parser.error("Continuous batching requires a vLLM engine")
+    if batching.mode == "static" and "base" in engines:
+        parser.error("Use a vLLM base-model control for the batching comparison")
+    if batching.base_settings == "normal" and any(
+        not e.startswith("vllm_base") for e in engines
+    ):
+        parser.error("Normal settings are a separate base-vLLM control")
     values = args.k or cfg["k_values"]
     if any(type(k) is not int or k < 1 for k in values) or len(set(values)) != len(
         values
@@ -685,15 +931,20 @@ def main() -> None:
                 "reserved_capacity": None,
                 "occupied_kv": None,
             },
-            "throughput_denominator": "sum of measured request wall times; excludes warmup and scoring",
+            "batching": asdict(batching),
+            "throughput_denominator": (
+                "sum of measured request wall times; excludes warmup and scoring"
+                if batching.mode == "sequential"
+                else "elapsed run measurement window"
+            ),
             "selected_gpu": args.gpu,
             "profiles": "untimed full-retention requests after measurement"
             if args.profile
             else None,
-            "baseline_settings": "BF16, eager, single request, no chunking/prefix cache; backend auto or forced Triton",
+            "baseline_settings": batching.base_settings,
         },
     )
-    all_rows = []
+    all_rows, all_runs = [], []
     env = dict(
         os.environ,
         CUDA_VISIBLE_DEVICES=args.gpu,
@@ -701,6 +952,9 @@ def main() -> None:
         VLLM_WORKER_MULTIPROC_METHOD="spawn",
         TOKENIZERS_PARALLELISM="false",
     )
+    if batching.mode != "sequential":
+        # Only local, trusted benchmark workers receive the memory-inspection RPC.
+        env["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
     # Resolve worker imports from this checkout.
     env.pop("PYTHONPATH", None)
     for engine in engines:
@@ -736,6 +990,22 @@ def main() -> None:
             "--cache",
             str(args.cache.resolve()),
         ]
+        command += [
+            "--mode",
+            args.mode,
+            "--batch-size",
+            str(args.batch_size),
+            "--duration",
+            str(args.duration),
+            "--seed",
+            str(args.seed),
+            "--base-settings",
+            args.base_settings,
+            "--ramp-up",
+            str(args.ramp_up),
+        ]
+        if args.max_batched_tokens is not None:
+            command += ["--max-batched-tokens", str(args.max_batched_tokens)]
         if args.profile:
             command.append("--profile")
         if args.vllm_source:
@@ -756,8 +1026,15 @@ def main() -> None:
                 {"status": "failed", "engine": engine, "log": str(log_path)},
             )
             raise RuntimeError(f"{LABELS[engine]} failed; see {log_path}")
-        all_rows.extend(
-            json.loads((args.output / f"{engine}.json").read_text())["rows"]
+        measured = json.loads((args.output / f"{engine}.json").read_text())
+        all_rows.extend(measured["rows"])
+        all_runs.extend(
+            dict(
+                run,
+                engine=engine,
+                model=inputs["config"].get("name", inputs["config"]["base_model"]),
+            )
+            for run in measured["runs"]
         )
         console.print(f"[green]Finished[/green] {LABELS[engine]}")
     by_case = defaultdict(dict)
@@ -791,7 +1068,8 @@ def main() -> None:
     (args.output / "measurements.jsonl").write_text(
         "".join(json.dumps(row, allow_nan=False) + "\n" for row in all_rows)
     )
-    summary = summarize(all_rows)
+    write_json(args.output / "runs.json", all_runs)
+    summary = summarize(all_rows, all_runs)
     write_json(args.output / "summary.json", summary)
     from rich.table import Table
 
@@ -803,6 +1081,7 @@ def main() -> None:
         "TTFT (ms)",
         "Final token (ms)",
         "Output tokens",
+        "Requests/s",
         "Tokens/s",
     ):
         table.add_column(col)
@@ -814,6 +1093,7 @@ def main() -> None:
             f"{row['ttft_ms']:.1f}",
             f"{row['final_ms']:.1f}",
             f"{row['output_tokens']:g}",
+            f"{row['requests_per_s']:.2f}",
             f"{row['output_tokens_per_s']:.1f}",
         )
     console.print(table)

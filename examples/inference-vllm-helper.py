@@ -9,6 +9,7 @@ latency figures with retrieval outcomes as PNG, PDF, and SVG.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -47,6 +48,20 @@ def saved_run_paths(variable: str) -> list[Path]:
     if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
         raise ValueError(f"{variable} must be a JSON list of directory paths")
     return [Path(path).expanduser().resolve() for path in paths]
+
+
+def saved_batching_runs():
+    """Read explicitly requested batching runs or a verified source selection."""
+    runs = saved_run_paths("TOKEN_GATE_BATCH_RUNS")
+    selection = os.environ.get("TOKEN_GATE_BATCH_SELECTION")
+    if runs and selection:
+        raise ValueError("Set either TOKEN_GATE_BATCH_RUNS or TOKEN_GATE_BATCH_SELECTION")
+    if selection:
+        runs, sources = batching_selection(Path(selection).expanduser().resolve())
+        if not runs:
+            raise ValueError("The batching selection contains no runs")
+        return runs, sources
+    return runs, None
 
 
 def prepare_vllm_runtime(repository: str, branch: str, revision: str) -> dict:
@@ -263,6 +278,11 @@ def run_benchmarks(
     original_python: str = sys.executable,
     vllm_python: str = sys.executable,
     cache: Path | None = None,
+    mode: str = "sequential",
+    batch_size: int = 1,
+    duration: float = 0.0,
+    base_settings: str = "matched",
+    budgets: list[int] | None = None,
 ) -> list[Path]:
     """Reuse saved measurements or launch each model through the benchmark CLI.
 
@@ -281,6 +301,12 @@ def run_benchmarks(
         original_python: Python executable for the runner and original worker.
         vllm_python: Python executable for the vLLM worker.
         cache: Model export cache; defaults to tokengate-benchmark under XDG_CACHE_HOME.
+        mode: Sequential requests, static batches, or continuous replenishment.
+        batch_size: Static batch size or maximum client concurrency.
+        duration: Sustained continuous-load window; zero makes one finite pass.
+        base_settings: Matched controls, or a separate normal-vLLM base control.
+        budgets: Positive retained-token budgets to measure alongside All;
+            None uses the model configuration's sweep.
 
     Returns:
         Directories containing the recorded measurements and their manifests.
@@ -291,7 +317,11 @@ def run_benchmarks(
     """
     if saved_runs:
         for run in saved_runs:
-            table, _ = load_results([run])
+            if mode == "sequential":
+                table, _ = load_results([run])
+            else:
+                inputs = json.loads((run / "inputs.json").read_text())
+                table = load_batching([run], [s["id"] for s in inputs["samples"]])
             manifest = json.loads((run / "manifest.json").read_text())
             console.print(
                 f"{run.name}: loaded {len(table[table.engine.isin(engines)])} settings, "
@@ -345,8 +375,22 @@ def run_benchmarks(
             "--engines",
             *engines,
         ]
+        command.extend(
+            [
+                "--mode",
+                mode,
+                "--batch-size",
+                str(batch_size),
+                "--duration",
+                str(duration),
+                "--base-settings",
+                base_settings,
+            ]
+        )
         if n is not None:
             command.extend(["--n", str(n)])
+        if budgets is not None:
+            command.extend(["--k", *map(str, budgets)])
         if profile:
             command.append("--profile")
         _run_logged(command, output / f"{config.stem}.log", "Warm up and measure")
@@ -487,6 +531,63 @@ def prepare_niah_configs(
     return prepared
 
 
+def run_batching_benchmarks(
+    configs: list[Path],
+    samples: Path,
+    output: Path,
+    *,
+    gpu: str,
+    vllm_source: Path,
+    vllm_python: str,
+    original_python: str = sys.executable,
+    budget: int = 2048,
+    sizes: tuple[int, ...] = (1, 2, 4, 8, 16),
+) -> list[Path]:
+    """Run Section 6 on the verified held-out pool in a new output directory.
+
+    For each model and size, measure static original/tiled/base inference,
+    finite continuous tiled/base inference, and 60-second sustained windows.
+    Each setting uses one warmup and three repetitions; the runner applies
+    a five-second ramp-up to sustained windows. All is included with budget.
+    Runs execute serially on the selected GPU. Existing output is preserved.
+    """
+    if type(budget) is not int or budget < 1:
+        raise ValueError("The retained-token budget must be a positive integer")
+    if (
+        not sizes
+        or any(type(size) is not int or size < 1 for size in sizes)
+        or len(set(sizes)) != len(sizes)
+    ):
+        raise ValueError("Batch sizes must be distinct positive integers")
+    if not configs or len({path.stem for path in configs}) != len(configs):
+        raise ValueError("Supply model configurations with distinct filenames")
+    if not (vllm_source / "tools/export_token_gate.py").is_file():
+        raise FileNotFoundError("Run prepare_vllm_runtime before starting inference")
+    output.mkdir(parents=True, exist_ok=False)
+    prepared = prepare_niah_configs(
+        configs, samples, output / "configs", python=original_python
+    )
+    runs = []
+    for mode, duration in (("static", 0), ("continuous", 0), ("continuous", 60)):
+        engines = ["vllm_tiled", "vllm_base"]
+        if mode == "static":
+            engines = ["original", *engines]
+        phase = "sustained" if duration else "finite"
+        for size in sizes:
+            runs.extend(run_benchmarks(
+                prepared, output / f"{mode}-{size}-{phase}",
+                saved_runs=[], engines=engines, split="test", n=None,
+                warmups=1, repeats=3, mode=mode, batch_size=size,
+                duration=duration, base_settings="matched", budgets=[budget],
+                gpu=gpu, vllm_source=vllm_source, vllm_python=vllm_python,
+                original_python=original_python,
+            ))
+    (output / "runs.json").write_text(
+        json.dumps([str(path.resolve()) for path in runs], indent=2) + "\n"
+    )
+    return runs
+
+
 def show_test_results(
     table, configs: list[Path], engines: list[str], output: Path
 ) -> None:
@@ -574,6 +675,8 @@ def load_results(directories: list[Path]):
         inputs = json.loads((directory / "inputs.json").read_text())
         manifest = json.loads((directory / "manifest.json").read_text())
         validation = json.loads((directory / "validation.json").read_text())
+        if manifest.get("batching", {}).get("mode", "sequential") != "sequential":
+            raise ValueError("Use load_batching for batched measurement windows")
         if validation["status"] == "failed":
             raise ValueError(f"Failed run: {directory}")
         qualified &= validation.get("qualified_speedups") is True
@@ -1005,6 +1108,434 @@ def load_tradeoff(directories: list[Path], expected_ids: list[str]):
             )
         result.append(item)
     return pd.DataFrame(result)
+
+
+def batching_selection(path: Path):
+    """Read a run selection with explicitly pinned sources for each implementation."""
+
+    selection = json.loads(path.read_text())
+    sources = {}
+    for name, item in selection["sources"].items():
+        content = (path.parent / item["path"]).read_bytes()
+        if hashlib.sha256(content).hexdigest() != item["sha256"]:
+            raise ValueError(f"Source manifest hash differs: {name}")
+        sources[name] = json.loads(content)
+    snapshots = {}
+    for item in selection["implementations"]:
+        key = (item["model"], item["engine"])
+        if key in snapshots:
+            raise ValueError(f"Duplicate implementation identity: {key}")
+        snapshots[key] = {
+            "tokengate": sources[item["tokengate_source"]],
+            "vllm": sources[item["vllm_source"]] if item["vllm_source"] else None,
+        }
+    directories = [(path.parent / name).resolve() for name in selection["runs"]]
+    if len(directories) != len(set(directories)):
+        raise ValueError("Duplicate selected run")
+    return directories, snapshots
+
+
+def load_batching(directories: list[Path], expected_ids: list[str], *, source_snapshots=None):
+    """Verify batching runs and separate finite-pass accuracy from sustained load.
+
+    Args:
+        directories: Complete, unsharded benchmark runs on one GPU each.
+        expected_ids: The unique samples required in every finite accuracy pass.
+        source_snapshots: Explicit TokenGate/vLLM identities per (model, engine).
+            Each implementation must use its pinned sources at every size and
+            in both finite and sustained runs. Without this map, all arms for
+            a model must share the same source identities.
+
+    Returns:
+        One row per model, engine, K, mode, size, and measurement phase.
+        Run-level intervals resample independent repetitions, never requests.
+    """
+    import math
+    import pandas as pd
+    from benchmarks.batching import BatchingConfig, validate_runs
+    from benchmarks.run_vllm_benchmark import (
+        TOKEN_GATE_ENGINES,
+        summarize,
+        validate_rows,
+    )
+
+    if not expected_ids or len(expected_ids) != len(set(expected_ids)):
+        raise ValueError("Expected sample IDs must be nonempty and unique")
+    records, identities, vllm_identities = [], {}, {}
+    for directory in directories:
+        inputs = json.loads((directory / "inputs.json").read_text())
+        manifest = json.loads((directory / "manifest.json").read_text())
+        validation = json.loads((directory / "validation.json").read_text())
+        if validation["status"] == "failed":
+            raise ValueError(f"Failed run: {directory}")
+        config = BatchingConfig(**manifest["batching"])
+        if config.mode == "sequential":
+            raise ValueError("A batching report requires elapsed run windows")
+        model = inputs["config"]["name"]
+        identity = (
+            inputs["sample_sha256"],
+            inputs["gate_sha256"],
+            inputs["adapter_sha256"],
+            inputs["base_files"],
+            inputs["source_sha256"] if source_snapshots is None else None,
+            {
+                k: v
+                for k, v in inputs["config"].items()
+                if k not in {"samples", "eval_split", "budgets", "k_values"}
+            },
+            config.seed,
+            config.ramp_up_s,
+        )
+        if model in identities and identities[model] != identity:
+            raise ValueError(f"Changed inputs, checkpoint, or code for {model}")
+        identities[model] = identity
+        # An original-only run need not load vLLM. All vLLM arms must use the same code.
+        if manifest["vllm_source"] and any(
+            engine.startswith("vllm") for engine in manifest["engines"]
+        ):
+            source = manifest["vllm_source"]["source_sha256"]
+            if model in vllm_identities and vllm_identities[model] != source:
+                raise ValueError(f"Changed vLLM source for {model}")
+            vllm_identities[model] = source
+        measurements = [
+            json.loads(line)
+            for line in (directory / "measurements.jsonl").read_text().splitlines()
+        ]
+        windows = json.loads((directory / "runs.json").read_text())
+        for engine in manifest["engines"]:
+            if source_snapshots is not None:
+                expected = source_snapshots.get((model, engine))
+                actual_vllm = (
+                    manifest["vllm_source"]["source_sha256"]
+                    if manifest["vllm_source"] else None
+                )
+                if expected is None or expected != {
+                    "tokengate": inputs["source_sha256"], "vllm": actual_vllm,
+                }:
+                    raise ValueError(f"Source snapshot differs for {model}/{engine}: {directory}")
+            rows = [r for r in measurements if r["engine"] == engine]
+            runs = [r for r in windows if r["engine"] == engine]
+            budgets = (
+                inputs["config"]["budgets"] if engine in TOKEN_GATE_ENGINES else ["All"]
+            )
+            validate_runs(rows, runs, inputs, budgets, manifest["repeats"], config)
+            if not config.duration_s:
+                if [s["id"] for s in inputs["samples"]] != expected_ids:
+                    raise ValueError(
+                        "Finite accuracy pass differs from the requested split"
+                    )
+                validate_rows(rows, inputs, budgets, manifest["repeats"])
+            for summary in summarize(rows, runs):
+                n, successes = summary["examples"], summary["correct"]
+                z, p = 1.959963984540054, successes / n
+                denominator = 1 + z * z / n
+                center = (p + z * z / (2 * n)) / denominator
+                radius = (
+                    z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denominator
+                )
+                summary.update(
+                    mode=config.mode,
+                    size=config.size,
+                    duration_s=config.duration_s,
+                    base_settings=config.base_settings,
+                    accuracy=None if config.duration_s else 100 * p,
+                    accuracy_low=None
+                    if config.duration_s
+                    else (0.0 if successes == 0 else 100 * max(0, center - radius)),
+                    accuracy_high=None
+                    if config.duration_s
+                    else (100.0 if successes == n else 100 * min(1, center + radius)),
+                    source=str(directory),
+                    source_snapshot=hashlib.sha256(json.dumps({
+                        "tokengate": inputs["source_sha256"],
+                        "vllm": manifest["vllm_source"]["source_sha256"]
+                        if manifest["vllm_source"] else None,
+                    }, sort_keys=True).encode()).hexdigest(),
+                )
+                records.append(summary)
+    table = pd.DataFrame(records)
+    if table.empty:
+        raise ValueError("Provide distinct, complete batching configurations")
+    table["phase"] = table.duration_s.gt(0).map({True: "sustained", False: "finite"})
+    keys = ["model", "engine", "budget", "mode", "size", "phase", "base_settings"]
+    if table.duplicated(keys).any():
+        raise ValueError("Provide distinct, complete batching configurations")
+    return table
+
+
+def plot_batching(table, budget: str, output: Path):
+    """Plot static/continuous performance with two columns per model.
+
+    Continuous performance uses sustained windows when present, paired with a
+    finite evaluation of the same configuration. Accuracy stays in the report
+    tables. Normal-vLLM controls remain separate from the matched comparison.
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.transforms import offset_copy
+    import seaborn as sns
+
+    matched = table[table.base_settings == "matched"]
+    models = matched.model.unique()
+    styles = {
+        "original": ("Original TokenGate", "#0072B2", "o"),
+        "vllm_tiled": ("TokenGate in vLLM (tiled prefill)", "#E6A400", "D"),
+        "vllm_base": ("Base Qwen in vLLM (All, auto)", "#858585", "s"),
+    }
+    with sns.axes_style("whitegrid"), plt.rc_context(PLOT_STYLE):
+        fig = plt.figure(
+            figsize=(6.8 * len(models) + 0.8 * (len(models) - 1), 7.6),
+            layout="constrained",
+        )
+        # Leave an empty grid column between model pairs, keeping panels wide.
+        columns = 3 * len(models) - 1
+        grid = fig.add_gridspec(
+            2, columns,
+            width_ratios=[0.24 if column % 3 == 2 else 1 for column in range(columns)],
+        )
+        axes = np.empty((2, 2 * len(models)), dtype=object)
+        for row in range(2):
+            for column in range(2 * len(models)):
+                axes[row, column] = fig.add_subplot(
+                    grid[row, column + column // 2],
+                    sharey=axes[0, column] if row else None,
+                )
+        handles = {}
+        for model_index, model in enumerate(models):
+            selected = matched[matched.model == model]
+            for row_index, mode in enumerate(("static", "continuous")):
+                for engine, (name, color, marker) in styles.items():
+                    budgets = (
+                        ("All",)
+                        if engine == "vllm_base" or str(budget) == "All"
+                        else (str(budget), "All")
+                    )
+                    for retained in budgets:
+                        k_label = "All" if retained == "All" else f"{int(retained):,}"
+                        label = name if engine == "vllm_base" else f"{name}, K={k_label}"
+                        line = ":" if retained == "All" and engine != "vllm_base" else "-"
+                        data = selected[
+                            (selected.engine == engine)
+                            & (selected["mode"] == mode)
+                            & (selected.budget.astype(str) == retained)
+                        ]
+                        finite = data[data.duration_s == 0].sort_values("size")
+                        sustained = data[data.duration_s > 0].sort_values("size")
+                        performance = (
+                            sustained
+                            if mode == "continuous" and not sustained.empty
+                            else finite
+                        )
+                        if performance.empty:
+                            continue
+                        if not set(performance["size"]) <= set(finite["size"]):
+                            raise ValueError(
+                                "Sustained performance needs a paired finite accuracy pass"
+                            )
+                        for column, metric in enumerate(
+                            ("requests_per_s", "ttft_p95_ms")
+                        ):
+                            stats = [value[metric] for value in performance.run_statistics]
+                            y = [item["mean"] for item in stats]
+                            has_intervals = all(item["low"] is not None for item in stats)
+                            error = (
+                                [
+                                    [item["mean"] - item["low"] for item in stats],
+                                    [item["high"] - item["mean"] for item in stats],
+                                ]
+                                if has_intervals
+                                else None
+                            )
+                            artist = axes[row_index, 2 * model_index + column].errorbar(
+                                performance["size"],
+                                y,
+                                yerr=error,
+                                color=color,
+                                marker=marker,
+                                linestyle=line,
+                                markersize=4,
+                                markeredgecolor="black",
+                                markeredgewidth=0.5,
+                                linewidth=1.1,
+                                capsize=2,
+                                elinewidth=0.7,
+                                label=label,
+                            )
+                            handles[label] = artist
+                for column, ylabel in enumerate(
+                    ("Throughput (requests/s)", "p95 TTFT (ms)")
+                ):
+                    ax = axes[row_index, 2 * model_index + column]
+                    ax.set(
+                        xscale="log",
+                        xlabel="Batch size $B$" if mode == "static" else "Concurrency $C$",
+                        ylabel=f"{model}\n{ylabel}",
+                    )
+                    sizes = sorted(selected[selected["mode"] == mode]["size"].unique())
+                    ax.set_xticks(sizes, labels=[str(n) for n in sizes])
+                    ax.minorticks_off()
+                    ax.grid(axis="x", visible=False)
+                    sns.despine(ax=ax)
+            comparison = selected[
+                (selected["mode"] == "continuous")
+                & (selected["size"] == 16)
+                & (selected.duration_s > 0)
+            ]
+            tiled = comparison[
+                (comparison.engine == "vllm_tiled")
+                & (comparison.budget.astype(str) == str(budget))
+            ]
+            base = comparison[
+                (comparison.engine == "vllm_base")
+                & (comparison.budget.astype(str) == "All")
+            ]
+            if len(tiled) == len(base) == 1:
+                tiled, base = tiled.iloc[0], base.iloc[0]
+                if tiled.duration_s != base.duration_s:
+                    raise ValueError("C=16 ratios require matching sustained windows")
+                for column, metric in enumerate(("requests_per_s", "ttft_p95_ms")):
+                    gated_value = tiled.run_statistics[metric]["mean"]
+                    base_value = base.run_statistics[metric]["mean"]
+                    if gated_value <= 0 or base_value <= 0:
+                        continue
+                    if metric == "requests_per_s":
+                        label = f"{gated_value / base_value:.2f}×"
+                    else:
+                        label = f"{base_value / gated_value:.1f}×"
+                    ax = axes[1, 2 * model_index + column]
+                    low, high = sorted((gated_value, base_value))
+                    bracket = offset_copy(ax.transData, fig=fig, x=8, units="points")
+                    ax.annotate(
+                        "",
+                        xy=(16, high),
+                        xytext=(16, low),
+                        xycoords=bracket,
+                        arrowprops=dict(
+                            arrowstyle="|-|,widthA=0.3,widthB=0.3",
+                            color="#444444",
+                            linewidth=0.9,
+                            shrinkA=0,
+                            shrinkB=0,
+                        ),
+                    )
+                    ax.annotate(
+                        label,
+                        xy=(16, (low + high) / 2),
+                        xytext=(-3, 0),
+                        textcoords="offset points",
+                        ha="right",
+                        va="center",
+                        fontsize=9,
+                        fontweight="bold",
+                        color="#333333",
+                        bbox=dict(facecolor="white", edgecolor="none", pad=2),
+                    )
+                    # Reserve space for the bracket while keeping row axes aligned.
+                    for row_ax in axes[:, 2 * model_index + column]:
+                        row_ax.set_xlim(right=max(row_ax.get_xlim()[1], 20))
+        # Set shared limits after both rows contribute their data and error bars.
+        for ax in axes[0]:
+            ax.set_ylim(bottom=0)
+        fig.legend(
+            handles.values(),
+            handles.keys(),
+            loc="outside upper center",
+            ncol=3,
+            frameon=False,
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        for suffix in ("png", "pdf", "svg"):
+            fig.savefig(output.with_suffix("." + suffix), dpi=600, bbox_inches="tight")
+    return fig
+
+
+def show_batching_results(
+    directories: list[Path],
+    expected_ids: list[str],
+    output: Path,
+    *,
+    budget: int = 2048,
+    source_snapshots=None,
+):
+    """Display verified static/continuous results for a budget and All.
+
+    The figure uses matched execution settings. The table also includes normal
+    vLLM controls when supplied. Sustained timings are paired with finite-pass
+    accuracy; failed configurations stay in the saved evidence and are omitted.
+    """
+    from IPython.display import display
+    import matplotlib.pyplot as plt
+
+    if not directories:
+        console.print(
+            "Set TOKEN_GATE_BATCH_RUNS to a JSON list of completed batching run "
+            "directories. See the batched-inference commands in README.md."
+        )
+        return None
+    complete = []
+    for directory in directories:
+        validation = json.loads((directory / "validation.json").read_text())
+        if validation["status"] != "failed":
+            complete.append(directory)
+    table = load_batching(complete, expected_ids, source_snapshots=source_snapshots)
+    output.mkdir(parents=True, exist_ok=True)
+    table.to_json(output / "summary.json", orient="records", indent=2)
+    labels = {
+        "original": "Original TokenGate",
+        "vllm_tiled": "TokenGate in vLLM (tiled prefill)",
+        "vllm_base": "Base Qwen in vLLM",
+    }
+    for model in table.model.unique():
+        selected = table[
+            (table.model == model)
+            & table.budget.astype(str).isin([str(budget), "All"])
+        ]
+        report = Table(title=f"{model}, {len(expected_ids)} test examples")
+        for column in (
+            "Mode",
+            "B / C",
+            "Implementation",
+            "K",
+            "Settings",
+            "Requests/s",
+            "p95 TTFT",
+            "Correct",
+        ):
+            report.add_column(column)
+        keys = ["mode", "size", "engine", "budget", "base_settings"]
+        for (mode, size, engine, retained, settings), group in selected.groupby(
+            keys, sort=True
+        ):
+            finite = group[group.phase == "finite"]
+            sustained = group[group.phase == "sustained"]
+            if len(finite) != 1:
+                raise ValueError(
+                    "Every performance configuration needs finite accuracy"
+                )
+            accuracy = finite.iloc[0]
+            performance = sustained.iloc[0] if not sustained.empty else accuracy
+            stats = performance.run_statistics
+            report.add_row(
+                mode,
+                str(size),
+                labels.get(engine, engine),
+                str(retained),
+                settings,
+                f"{stats['requests_per_s']['mean']:.2f}",
+                f"{stats['ttft_p95_ms']['mean']:.0f} ms",
+                f"{int(accuracy.correct)}/{int(accuracy.examples)}",
+            )
+        console.print(report)
+    console.print(
+        f"TokenGate K={budget:,} is solid; K=All is dotted. "
+        "Base Qwen retains all tokens. "
+        "Continuous throughput uses sustained windows when available. "
+        "Accuracy in the tables counts each test example once."
+    )
+    figure = plot_batching(table, str(budget), output / f"both-models-k{budget}-all")
+    display(figure)
+    plt.close(figure)
+    return table
 
 
 def main():
