@@ -115,11 +115,11 @@ def generate_batch(
     v16a step-0 OOM).
 
     When supplied, streamer receives each generated token (including EOS) as
-    a CPU tensor via put(), followed by end(). Streaming supports one input;
-    no prompt tokens are emitted and the default path adds no transfers.
+    a CPU tensor of shape [batch_size, 1] via put(), followed by end().
+    Row order stays fixed. Consumers must ignore tokens after each row's first
+    EOS because generation continues until every row finishes. No prompt tokens
+    are emitted and the default path adds no transfers.
     """
-    if streamer is not None and len(prompt_ids_list) != 1:
-        raise ValueError("Token streaming requires exactly one input")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     inner = model.model

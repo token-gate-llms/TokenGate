@@ -108,8 +108,10 @@ class TokenGateModel:
             prefill into the KV cache (the paper's K). None = keep all
             (no pruning).
         streamer : optional object with ``put(cpu_token_ids)`` and ``end()``.
-            Receives generated tokens, including EOS, for a single input.
-            Prompt tokens are not emitted. None leaves generation unchanged.
+            Receives one generated token per batch row as a CPU tensor shaped
+            [batch_size, 1], including EOS, in input order. Ignore tokens after
+            each row's first EOS. Prompt tokens are not emitted. None leaves
+            generation unchanged.
         """
         if ids and isinstance(ids[0], int):
             ids = [ids]
