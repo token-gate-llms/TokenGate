@@ -1,7 +1,7 @@
 <p align="center"><img src="assets/title.png" width="60%" alt="Token-Gated Language Models"></p>
 
 <p align="center"><b>LLMs that can <I>skim</I> their context to selectively read the tokens that matter.</b></p>
-<p align="center"><b>Skimming beats full reads: up to 11x speedup & 3x lower memory for long-context prefill.</b></p>
+<p align="center"><b>Process all your context with up to 11x speedups and 3x lower memory during prefill, at no accuracy loss.</b></p>
 
 
 <p align="center">
@@ -14,7 +14,7 @@
 
 ## ⚡ What is TokenGate?
 
-Current language models read all tokens of their input context, processing each one through all model layers. **TokenGated Language Models can *skim*, selectively processing only context that matters** through learned token selection for up to **11.3x faster** prefill with **3.4x lower memory** at **no accuracy degradation**. TokenGate extends existing models to enable conditional computing, akin to MoE layers, but for a different scaling dimension: long-context inputs. 
+Current language models read all tokens of their input context, processing each one through all model layers. **TokenGated Language Models can *skim*, selectively processing only context that matters** through learned token selection for up to **11.3x faster** prefill with **3.4x lower memory** at **no accuracy degradation**. TokenGate extends existing models to enable conditional computing, akin to MoE layers, but for a different scaling dimension: context tokens. 
 
 ## 🔥 Make your LLM a Token-Gated Language Model
 TokenGate is **a drop-in neural network component that extends existing trained models** (e.g., trained transformers or hybrid architectures) to enable learnable token selection with light-weight adaptation. You can **adapt your model with TokenGate as a replacement to standard fine-tuning or PEFT**. While standard fine-tuning allows models to improve task-specific accuracy, training models with TokenGate allows models to *improve both accuracy and prefill efficiency* for Pareto-optimal inference performance. Training with TokenGate is as simple and efficient as standard PEFT training.
