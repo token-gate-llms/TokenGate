@@ -1156,6 +1156,7 @@ def set_gate_bias_for_layers(
 
 
 GATE_ATTN = {
+    "sdpa": ("sdpa", "sdpa"),
     # name -> (causal backend, gate-bias backend); see flex_attention_utils.
     "flex": ("flex", "flex"),
     "cudnn-p2": ("flex", "vweight-cudnn"),
