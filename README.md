@@ -189,8 +189,8 @@ the gate's selection lands squarely on the needle sentence.
 A second demo on real data follows the same pattern:
 `examples/biodexr_demo.py` (BioDEX adverse-drug-reaction extraction; mean
 exact-match set F1 0.622 at K=2000 over the committed val articles). Both
-pipelines are covered by `python -m tokengate.e2e_gate.tests.test_niah_demo`
-and `...tests.test_biodexr_demo`, and `--gate-attn flex` avoids the
+pipelines are covered by `python -m tests.test_niah_demo`
+and `python -m tests.test_biodexr_demo`, and `--gate-attn flex` avoids the
 custom-kernel build at some speed cost.
 
 For a full accuracy + latency comparison against standard prefill,

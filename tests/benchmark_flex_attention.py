@@ -6,7 +6,7 @@ Measure actual speedup and memory savings for:
 2. Phase 2: Causal + gate bias on pruned sequence
 
 Run:
-    python -m tokengate.e2e_gate.tests.benchmark_flex_attention
+    python -m tests.benchmark_flex_attention
 """
 
 import json

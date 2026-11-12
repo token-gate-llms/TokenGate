@@ -6,7 +6,7 @@ samples must match those computed by running the same N samples individually
 and averaging.
 
 Run with:
-    python -m tokengate.e2e_gate.tests.test_batched_equivalence
+    python -m tests.test_batched_equivalence
 """
 
 import sys

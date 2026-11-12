@@ -15,17 +15,19 @@ training takes an explicit `attn_backend="flex"`.
 
 ## Running tests
 
-Tests are script-style (`python -m <module>`), not pytest. CPU-safe:
+All tests live in the root `tests/` directory. They are script-style
+(`python -m tests.<module>`), not pytest; run them from the repository root.
+CPU-safe:
 
 ```bash
-python -m tokengate.e2e_gate.tests.test_trainer_api
+python -m tests.test_trainer_api
 ```
 
 GPU tests (one GPU each) exercise the released checkpoints end to end:
 
 ```bash
-python -m tokengate.e2e_gate.tests.test_niah_demo
-python -m tokengate.e2e_gate.tests.test_biodexr_demo
+python -m tests.test_niah_demo
+python -m tests.test_biodexr_demo
 ```
 
 ## Conventions

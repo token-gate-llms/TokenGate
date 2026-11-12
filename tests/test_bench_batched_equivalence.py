@@ -23,7 +23,7 @@ shifted by pad count, pad tokens attended, cache mis-packing) produces gross
 divergence — near-zero kept overlap or immediate garbage — far outside them.
 
 Run with:
-    python -m tokengate.e2e_gate.tests.test_bench_batched_equivalence
+    python -m tests.test_bench_batched_equivalence
     # hybrid (gate layer must be a full-attention layer, e.g. 3):
     python -m ... --base-model Qwen/Qwen3.5-2B --gate-layer 3
 """
@@ -42,7 +42,7 @@ from tokengate.e2e_gate.bench.benchmark_gate_e2e import (
     vanilla_generate_batch, vanilla_generate_single,
 )
 from tokengate.datasets.tasks import get_task
-from tokengate.e2e_gate.tests.test_batched_equivalence import _make_batch_item
+from tests.test_batched_equivalence import _make_batch_item
 
 K = 50
 MAX_NEW = 32

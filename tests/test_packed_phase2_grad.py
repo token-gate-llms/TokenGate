@@ -5,12 +5,12 @@ the full-context sentinel, fa2 kernels, LoRA r16 on q/v of every layer, MLP scor
 branch) run both ways from the same weights: the loss and every gradient (adapters,
 gate, scoring branch) must agree to bf16 kernel noise.
 
-Run (1 GPU):  python -m tokengate.e2e_gate.tests.test_packed_phase2_grad
+Run (1 GPU):  python -m tests.test_packed_phase2_grad
 """
 import os
 import sys
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
