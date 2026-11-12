@@ -290,6 +290,23 @@ def build_gate_branch(model, gate, gate_layer: int):
     # branch is an independent copy of the CURRENT effective weights with no adapter
     # plumbing and none of the frozen base unfrozen.
     def _effective(child):
+        # Hugging Face decision checkpoints such as JEV attach their LoRA via
+        # PEFT's injected Linear wrappers, rather than TokenGate's LoRALinear.
+        # Materialize the active adapter into the independent scoring branch.
+        if hasattr(child, "base_layer") and hasattr(child, "lora_A") and hasattr(child, "lora_B"):
+            base = child.base_layer
+            if not isinstance(base, nn.Linear) or getattr(child, "fan_in_fan_out", False):
+                raise NotImplementedError("Only PEFT LoRA on nn.Linear is supported by the gate branch")
+            w = base.weight.detach().to(torch.float32).clone()
+            if not getattr(child, "merged", False) and not getattr(child, "disable_adapters", False):
+                for adapter in child.active_adapters:
+                    if adapter not in child.lora_A:
+                        continue
+                    A = child.lora_A[adapter].weight.detach().to(torch.float32)
+                    B = child.lora_B[adapter].weight.detach().to(torch.float32)
+                    w.addmm_(B, A, beta=1, alpha=child.scaling[adapter])
+            b = None if base.bias is None else base.bias.detach().to(torch.float32)
+            return w, b
         if child.__class__.__name__ in ("DeltaLinear", "LoRALinear"):
             base = child.linear
             w = base.weight.detach().to(torch.float32)
@@ -390,12 +407,13 @@ def _attn_only_forward_eager(layer, hidden_states, position_ids, cache, cache_po
 
     Hybrid Qwen3.5: a linear-attention gate layer dispatches to `linear_attn`
     with its own signature (no RoPE, no cache_position — mirrors
-    Qwen3_5DecoderLayer.forward); homogeneous Qwen3 layers have no `layer_type`
-    attribute and take the full-attention path unchanged.
+    Qwen3_5DecoderLayer.forward). Transformers versions call the mixer type
+    `layer_type` or `block_type`; homogeneous Qwen3 uses the full-attention path.
     """
     residual = hidden_states
     hs = layer.input_layernorm(hidden_states)
-    if getattr(layer, "layer_type", "full_attention") == "linear_attention":
+    mixer_type = getattr(layer, "block_type", getattr(layer, "layer_type", "full_attention"))
+    if mixer_type == "linear_attention":
         hs = layer.linear_attn(
             hidden_states=hs,
             cache_params=cache,
@@ -443,7 +461,7 @@ def call_layer_padsafe(layer, hs, pad_lens, **kwargs):
     positions were never affected (causality), so the TRAIN forward does not
     route through this helper."""
     call = kwargs.pop("fn", layer)
-    if getattr(layer, "layer_type", "full_attention") != "linear_attention" \
+    if getattr(layer, "block_type", getattr(layer, "layer_type", "full_attention")) != "linear_attention" \
             or not any(pad_lens):
         return call(hs, **kwargs)
     B, S, H = hs.shape
@@ -1245,6 +1263,7 @@ def prefill_batch_for_decode(
     gate_layer: int,
     K: int,
     prune_below_gate: bool = False,
+    return_logits: bool = False,
 ) -> Tuple[torch.Tensor, DynamicCache, torch.Tensor, List[int], List[int]]:
     """Batched Phase 1 → gate → prune → Phase 2 → first token for B prompts.
 
@@ -1279,7 +1298,10 @@ def prefill_batch_for_decode(
         K: Number of article tokens to keep.
 
     Returns:
-        first_tokens : (B, 1) int64 — argmax first token per sample.
+        first_tokens : (B, 1) int64 — argmax first token per sample by default.
+                       With return_logits=True, (B, output_dim) head scores
+                       instead. This supports readout heads that make a decision
+                       at the last prompt token without autoregressive decode.
         cache        : DynamicCache with max_n_kept entries for all layers,
                        ready for autoregressive decoding.
         kept_positions: (B, max_n_kept) int64 position IDs of kept tokens.
@@ -1521,7 +1543,8 @@ def prefill_batch_for_decode(
     # The final norm is per token: only the row that feeds lm_head needs it.
     last_valid = torch.tensor([n - 1 for n in n_kepts], device=hs_device)
     hs_last    = inner.norm(hs_pruned[torch.arange(B, device=hs_device), last_valid, :])  # (B, hidden)
-    first_tokens = model.lm_head(hs_last).argmax(-1, keepdim=True).to(device)  # (B, 1)
+    head_scores = model.lm_head(hs_last)
+    first_tokens = (head_scores if return_logits else head_scores.argmax(-1, keepdim=True)).to(device)
     if n_alloc != max_n_kept:
         # The bucket's pad slots leave the caches and the positions here.
         for i in range(gate_layer + 1, len(inner.layers)):
