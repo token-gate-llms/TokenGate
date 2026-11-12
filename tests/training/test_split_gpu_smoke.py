@@ -14,12 +14,12 @@ REAL training path (forward_backward_with_gate_multi_K_detach, M=2 K values):
   6. a second call with a FROZEN copy of the gate config still runs (frozen-path
      regression: reconnection skipped, no crash).
 
-Run (1 GPU):  python -m tests.test_split_gpu_smoke
+Run (1 GPU):  python -m tests.training.test_split_gpu_smoke
 """
 import os
 import sys
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")

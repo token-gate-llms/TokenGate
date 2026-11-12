@@ -12,19 +12,19 @@ realistic seq lengths) or synthetic sequences of a specified length.
 Usage
 -----
 # With real data (reads from a tokenized cache or builds one):
-python -m tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B \\
     --gate-layer 8 --k-low 50 --k-high 5000 \\
     --dataset biodex --task biodex_reactions
 
 # Synthetic sequences (no dataset needed):
-python -m tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B \\
     --gate-layer 8 --k-low 50 --k-high 5000 \\
     --synthetic --seq-len 8192 --article-len 6000
 
 # Sweep specific batch sizes only:
-python -m tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B --gate-layer 8 \\
     --batch-sizes 1 2 4 8 16 --k-values 500 2000 5000
 """

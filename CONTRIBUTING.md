@@ -1,44 +1,51 @@
 # Contributing to TokenGate
 
-Thanks for your interest! Issues and pull requests are welcome.
+## Setup
 
-## Development setup
-
-```bash
-git clone https://github.com/tokengate-models/TokenGate && cd TokenGate
-uv venv && uv pip install -e ".[train]"      # Python >= 3.10, CUDA PyTorch >= 2.9
-python kernels/fa2bias/build.py              # optional: the fast key-bias kernel (needs nvcc)
-```
-
-Without the kernel build, inference falls back to FlexAttention automatically and
-training takes an explicit `attn_backend="flex"`.
-
-## Running tests
-
-All tests live in the root `tests/` directory. They are script-style
-(`python -m tests.<module>`), not pytest; run them from the repository root.
-CPU-safe:
+TokenGate requires Python 3.10 or newer and PyTorch 2.9 or newer. To get started:
 
 ```bash
-python -m tests.test_trainer_api
+git clone https://github.com/token-gate-llms/TokenGate && cd TokenGate
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[train]"
 ```
 
-GPU tests (one GPU each) exercise the released checkpoints end to end:
+For CPU tests, use `uv pip install --torch-backend=cpu -e .` instead.
+For CUDA training, you can build the fast attention kernel with
+`python kernels/fa2bias/build.py` (requires `nvcc`). Without it, inference
+falls back to FlexAttention; training needs `attn_backend="flex"`.
+
+## Tests
+
+Tests live under `tests/`, grouped by subsystem. Run each script as a module
+from the repository root. These five suites run on CPU:
 
 ```bash
-python -m tests.test_niah_demo
-python -m tests.test_biodexr_demo
+python -m tests.training.test_trainer_api
+python -m tests.training.test_swa_precision
+python -m tests.gate.test_split_gate_layer
+python -m tests.gate.test_gate_branch_graph
+python -m tests.inference.test_inference_api
 ```
 
-## Conventions
+Some tests download public Qwen configs or tokenizers from Hugging Face.
+The remaining suites need CUDA, model weights, or prepared data; each script
+describes its requirements. For example, these test the released demos:
 
-- **Fail loudly.** No silent defaults or fallbacks that change results — a config
-  error should stop the run with a message naming the fix. The one exception is
-  inference kernel fallback, which warns.
-- **Never add an `__init__.py` under top-level `datasets/`.** It is a data directory,
-  not a package — a top-level `datasets` package would shadow the HuggingFace
-  `datasets` library for any process started from the repo root.
-- **Code lives in `tokengate/`, data in `datasets/`.** Per-dataset `prepare.py`
-  scripts are run by path; generated stores stay gitignored.
-- Keep PRs focused, and include the test output for anything touching training or
-  benchmark code paths.
+```bash
+python -m tests.examples.test_niah_demo
+python -m tests.examples.test_biodexr_demo
+```
+
+Performance benchmarks live in `benchmarks/`.
+
+## Contributions
+
+- Keep each PR focused and include the relevant test results.
+- Raise clear errors for invalid configuration. Inference's documented
+  attention fallback should warn.
+- Keep code in `tokengate/` and prepared data in `datasets/`. Run dataset
+  preparation scripts by path; leave generated stores out of Git.
+- Keep `datasets/` without an `__init__.py`: making it a Python package would
+  shadow the Hugging Face library.

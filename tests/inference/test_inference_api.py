@@ -7,7 +7,7 @@ modes; split_state_span fails loudly on ids without a valid span; and the
 demo's task-derived {state} template renders token-identically to the task's
 own format_prompt. Needs the Qwen3-1.7B tokenizer (HF cache), no GPU.
 
-Run: python -m tests.test_inference_api
+Run: python -m tests.inference.test_inference_api
 """
 
 ARTICLE = ("Within 2 days of starting oral amoxicillin the patient developed "

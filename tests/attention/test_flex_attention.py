@@ -8,7 +8,7 @@ the current dense mask implementation for:
 3. Gradient flow through score_mod
 
 Run:
-    python -m tests.test_flex_attention
+    python -m tests.attention.test_flex_attention
 """
 
 import torch
