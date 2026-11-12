@@ -1,10 +1,12 @@
 # Roadmap
 
 TODOs:
-- [ ] **CI** — GitHub Actions on push/PR: ruff lint + format check, a CPU test job
-  (`python -m tests.test_trainer_api`, config validation, import
-  checks), and a README link checker. Badges (CI, arXiv, license, HF models) at the
-  top of the README.
+- [x] **CPU test CI** — GitHub Actions on push/PR runs the five lightweight CPU
+  suites on Python 3.10 and 3.12.
+- [ ] **Require passing CI** — a repository administrator must require the
+  `Tests` check on `main` (see CONTRIBUTING.md).
+- [ ] **Additional CI** — ruff lint + format check, a README link checker, GPU
+  test runners, and badges (CI, arXiv, license, HF models) on the README.
 - [ ] **PyPI package** — `pip install tokengate` with a torch-light core for inference
   and a `[train]` extra. Prerequisite: the `kernels.fa2bias` import path resolves from
   the repo root today, so a non-editable wheel install breaks on it — move the kernel
