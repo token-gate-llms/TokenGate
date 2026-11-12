@@ -40,18 +40,17 @@ jobs:
         run: |
           uv venv
           uv pip install --torch-backend=cpu -e .
-      # These suites have script-style entry points. Running pytest would miss
-      # main() checks and treat functions returning False as successful tests.
+      # Run each script's entry point to preserve its checks and exit status.
       - name: Trainer API
-        run: .venv/bin/python -m tests.test_trainer_api
+        run: .venv/bin/python -m tests.training.test_trainer_api
       - name: SWA precision
-        run: .venv/bin/python -m tests.test_swa_precision
+        run: .venv/bin/python -m tests.training.test_swa_precision
       - name: Gate layer split
-        run: .venv/bin/python -m tests.test_split_gate_layer
+        run: .venv/bin/python -m tests.gate.test_split_gate_layer
       - name: Gate branch gradients
-        run: .venv/bin/python -m tests.test_gate_branch_graph
+        run: .venv/bin/python -m tests.gate.test_gate_branch_graph
       - name: Inference API
-        run: .venv/bin/python -m tests.test_inference_api
+        run: .venv/bin/python -m tests.inference.test_inference_api
 
   tests:
     # Require this stable check name in the main branch's protection/ruleset.

@@ -12,7 +12,7 @@
 6. The adapter-SWA flow (delta adapter): fp32 clone seed, in-place update from the live
    params, swap-in for eval, exact restore.
 
-Run: python -m tests.test_swa_precision
+Run: python -m tests.training.test_swa_precision
 """
 import copy
 import os

@@ -9,7 +9,7 @@ time", which killed all 8 ranks of the first qasper-gbmlpadapter run under the o
 hook-capture design) is structurally impossible here — asserted by running the same
 multi-K backward pattern the trainer uses.
 
-Run: python -m tests.test_gate_branch_graph
+Run: python -m tests.gate.test_gate_branch_graph
 """
 import torch
 from transformers import AutoConfig

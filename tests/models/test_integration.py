@@ -4,7 +4,7 @@
 Quick sanity check that the patched model works correctly.
 
 Run:
-    python -m tests.test_integration
+    python -m tests.models.test_integration
 """
 
 import torch
