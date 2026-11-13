@@ -26,6 +26,8 @@ Run with:
     python -m tests.inference.test_bench_batched_equivalence
     # hybrid (gate layer must be a full-attention layer, e.g. 3):
     python -m ... --base-model Qwen/Qwen3.5-2B --gate-layer 3
+    # Check the inference kernels used by the published-checkpoint benchmark:
+    python -m ... --paths gate --gate-attn fa2
 """
 
 import torch
@@ -35,6 +37,7 @@ from tokengate.e2e_gate.gate_module.e2e_gate_module import E2EGate
 from tokengate.e2e_gate.gate_module.gate_forward import build_gate_branch, prefill_batch_for_decode
 from tokengate.e2e_gate.attn.qwen3_flex_attention import (
     get_full_attn_layer_indices, patch_model_with_flex_attention,
+    set_attention_backends_for_layers,
 )
 from tokengate.e2e_gate.attn.flex_attention_utils import warmup_flex_attention
 from tokengate.e2e_gate.bench.benchmark_gate_e2e import (
@@ -122,8 +125,10 @@ def run_test(a):
         model = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map={"": device})
         model = patch_model_with_flex_attention(model)
+        set_attention_backends_for_layers(model, a.gate_attn)
         model.eval()
-        warmup_flex_attention(device)
+        if a.gate_attn == "flex":
+            warmup_flex_attention(device)
 
         nlb = len([i for i in get_full_attn_layer_indices(model) if i > gate_layer])
         gate = E2EGate(d_model=model.config.hidden_size,
@@ -330,6 +335,8 @@ if __name__ == "__main__":
                     help="gate layer; default 4 (synthetic) / 0 (--real)")
     ap.add_argument("--paths", default="gate,vanilla",
                     help="comma list of synthetic paths to check: gate,vanilla")
+    ap.add_argument("--gate-attn", choices=("flex", "fa2"), default="flex",
+                    help="attention backend for the synthetic gate-path check")
     ap.add_argument("--prune-below", action=argparse.BooleanOptionalAction,
                     default=False,
                     help="run the gate path with the below-gate KV "

@@ -28,6 +28,7 @@ jobs:
       OMP_NUM_THREADS: "1"
       MKL_NUM_THREADS: "1"
       TOKENIZERS_PARALLELISM: "false"
+      MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,7 +40,7 @@ jobs:
       - name: Install package with CPU PyTorch
         run: |
           uv venv
-          uv pip install --torch-backend=cpu -e .
+          uv pip install --torch-backend=cpu -e '.[benchmark]' pytest
       # Run each script's entry point to preserve its checks and exit status.
       - name: Trainer API
         run: .venv/bin/python -m tests.training.test_trainer_api
@@ -51,6 +52,10 @@ jobs:
         run: .venv/bin/python -m tests.gate.test_gate_branch_graph
       - name: Inference API
         run: .venv/bin/python -m tests.inference.test_inference_api
+      - name: Prefill memory
+        run: .venv/bin/python -m tests.inference.test_prefill_memory
+      - name: Benchmark and padding regressions
+        run: .venv/bin/python -m pytest tests/benchmarks tests/inference/test_prefill_padding.py -q
 
   tests:
     # Require this stable check name in the main branch's protection/ruleset.

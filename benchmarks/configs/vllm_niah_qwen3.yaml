@@ -1,0 +1,15 @@
+# Public Qwen3 release. Both engines use these exact weights and prompt tokens.
+name: Qwen3-1.7B
+base_model: Qwen/Qwen3-1.7B
+base_revision: 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e
+checkpoint: liana313/tokengate-niah-qwen3-1.7b
+checkpoint_revision: af6ce997a12dfd956a8d057917e1ecc24adf81d5
+gate_file: gate_step3000.pt
+adapter_file: lora_step3000.pt
+gate_layer: 1
+task: niah_kamradt
+samples: examples/data/niah_32k_samples.jsonl
+k_values: [64, 512, 2048, 4096, 8192]
+max_new_tokens: 64
+gate_attn: fa2
+engines: [original, vllm, vllm_base, vllm_base_triton, vllm_adapter, vllm_adapter_triton]
