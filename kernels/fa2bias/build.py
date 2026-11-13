@@ -39,8 +39,10 @@ if SRC.exists() and (not MARK.exists() or MARK.read_text() != PATCHSET):
     shutil.rmtree(BUILD / "ext", ignore_errors=True)
 if not SDIST.exists():
     SDIST.parent.mkdir(parents=True, exist_ok=True)
+    # flash-attn's source metadata imports torch. Build isolation hides the
+    # installed torch package and makes the sdist download fail before compile.
     subprocess.run([sys.executable, "-m", "pip", "download", f"flash-attn=={VERSION}", "--no-deps",
-                    "--no-binary", ":all:", "-d", str(SDIST.parent)], check=True)
+                    "--no-build-isolation", "--no-binary", ":all:", "-d", str(SDIST.parent)], check=True)
 if not SRC.exists():
     with tarfile.open(SDIST) as t:
         t.extractall(BUILD, filter="data")

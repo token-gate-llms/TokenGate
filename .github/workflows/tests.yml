@@ -51,6 +51,8 @@ jobs:
         run: .venv/bin/python -m tests.gate.test_gate_branch_graph
       - name: Inference API
         run: .venv/bin/python -m tests.inference.test_inference_api
+      - name: SDPA attention compatibility
+        run: .venv/bin/python -m tests.attention.test_sdpa_compat
 
   tests:
     # Require this stable check name in the main branch's protection/ruleset.
