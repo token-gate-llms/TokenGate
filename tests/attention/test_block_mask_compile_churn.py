@@ -18,7 +18,7 @@ pre-mixed-K run used.  The compiled path is reserved for genuinely long
 sequences that would OOM the eager grid.
 
 Run:
-    python -m tokengate.e2e_gate.tests.test_block_mask_compile_churn
+    python -m tests.attention.test_block_mask_compile_churn
 """
 
 import random

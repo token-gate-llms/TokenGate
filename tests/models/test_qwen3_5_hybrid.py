@@ -14,7 +14,7 @@ Qwen/Qwen3.5-2B (24 layers, full-attn at {3,7,11,15,19,23}):
                           layers; zero-init adapters leave logits unchanged.
 
 Run (single GPU, ~7 GB):
-    python -m tokengate.e2e_gate.tests.test_qwen3_5_hybrid
+    python -m tests.models.test_qwen3_5_hybrid
 """
 
 import torch

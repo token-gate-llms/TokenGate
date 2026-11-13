@@ -6045,7 +6045,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "the targets run one after the other).  Needs --attn-backends fa2 with the "
                              "varlen key-bias build (kernels/fa2bias), batch size 1, no Phase-2 "
                              "activation checkpointing.  Same losses and gradients as the sequential path "
-                             "(tests/test_packed_phase2_grad.py).")
+                             "(tests/training/test_packed_phase2_grad.py).")
     parser.add_argument("--compile-phase2", action="store_true",
                         help="EXPERIMENTAL: wrap each phase-2 transformer layer with "
                              "torch.compile(dynamic=True, fullgraph=False).  FlexAttention "
