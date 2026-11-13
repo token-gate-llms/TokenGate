@@ -19,14 +19,14 @@ Validates, on a REAL Qwen3DecoderLayer (small config, CPU, no GPU needed):
      on the layer's ATTENTION weights. Under the old severed hook capture this
      grad was identically zero (also asserted).
 
-Run:  python -m tokengate.e2e_gate.tests.test_split_gate_layer
+Run:  python -m tests.gate.test_split_gate_layer
 """
 import os
 import sys
 
 import torch
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 

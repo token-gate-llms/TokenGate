@@ -1,6 +1,6 @@
 """CPU regression for batched prefill's full-context activation lifetimes.
 
-Run: python -m tokengate.e2e_gate.tests.test_prefill_memory
+Run: python -m tests.inference.test_prefill_memory
 """
 
 import copy

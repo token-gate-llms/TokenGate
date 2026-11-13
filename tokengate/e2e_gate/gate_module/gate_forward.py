@@ -272,7 +272,7 @@ def build_gate_branch(model, gate, gate_layer: int):
     Parameter STORAGE is always float32 (CastLinear): the optimizer update and the
     SWA running mean both need it -- a bf16 param rounds away every per-step Muon
     update below its ULP (at |w|~0.02: ~80% of elements at lr=1e-4, ~97% at 1.4e-5),
-    and a bf16 running mean decays as n0/n (tests/test_swa_precision.py).
+    and a bf16 running mean decays as n0/n (tests/training/test_swa_precision.py).
     COMPUTE runs in the dtype of the branch input (the backbone's a_j boundary: bf16
     for a bf16 backbone) -- CastLinear casts its fp32 weights to the input dtype per
     forward, so the matmuls stay at backbone precision and cost (the branch is
@@ -350,7 +350,7 @@ def split_gate_layer_mlp(gate) -> bool:
     the branch reads hs_d, so the scoring gradient reaches Phase 1 through the same
     single reconnection as the LM gradient) and runs the BACKBONE gate-layer MLP on
     kept tokens only at Phase-2 entry (`gate_layer_mlp`) — exact, because the MLP is
-    position-wise (tests/test_split_gate_layer.py).
+    position-wise (tests/gate/test_split_gate_layer.py).
     """
     return getattr(gate, "gate_branch", None) is not None
 

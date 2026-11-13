@@ -1,0 +1,75 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-tests:
+    name: CPU tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Install package with CPU PyTorch
+        run: |
+          uv venv
+          uv pip install --torch-backend=cpu -e '.[benchmark]' pytest
+      # Run each script's entry point to preserve its checks and exit status.
+      - name: Trainer API
+        run: .venv/bin/python -m tests.training.test_trainer_api
+      - name: SWA precision
+        run: .venv/bin/python -m tests.training.test_swa_precision
+      - name: Gate layer split
+        run: .venv/bin/python -m tests.gate.test_split_gate_layer
+      - name: Gate branch gradients
+        run: .venv/bin/python -m tests.gate.test_gate_branch_graph
+      - name: Inference API
+        run: .venv/bin/python -m tests.inference.test_inference_api
+      - name: Prefill memory
+        run: .venv/bin/python -m tests.inference.test_prefill_memory
+      - name: Benchmark and padding regressions
+        run: .venv/bin/python -m pytest tests/benchmarks tests/inference/test_prefill_padding.py -q
+
+  tests:
+    # Require this stable check name in the main branch's protection/ruleset.
+    name: Tests
+    if: ${{ always() }}
+    needs: [cpu-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every CPU test job to pass
+        env:
+          CPU_TEST_RESULT: ${{ needs.cpu-tests.result }}
+        run: |
+          if [ "$CPU_TEST_RESULT" != "success" ]; then
+            echo "CPU tests did not all pass: $CPU_TEST_RESULT"
+            exit 1
+          fi

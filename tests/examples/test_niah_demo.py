@@ -9,7 +9,7 @@ scoring) broke, not that the model got unlucky.
 
 Run (single GPU):
 
-    python -m tokengate.e2e_gate.tests.test_niah_demo
+    python -m tests.examples.test_niah_demo
 
 Not a pytest test (repo convention): prints a pass/fail summary and exits
 non-zero on failure.
@@ -17,7 +17,7 @@ non-zero on failure.
 import os
 import sys
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 

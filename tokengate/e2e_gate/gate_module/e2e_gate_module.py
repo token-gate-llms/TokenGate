@@ -181,7 +181,7 @@ def swa_inplace_update(avg_params, cur_params, n: int) -> None:
     average must be float32 (asserted).  The previous form, mul_(n).add_(cur).div_(n+1)
     in the parameter's own dtype, loses `cur` entirely in bf16 once n > ~300 and then
     multiplies by n/(n+1) every step, so the average decays as n0/n toward zero
-    (tests/test_swa_precision.py).
+    (tests/training/test_swa_precision.py).
     """
     avg_params = list(avg_params)
     cur_params = list(cur_params)
