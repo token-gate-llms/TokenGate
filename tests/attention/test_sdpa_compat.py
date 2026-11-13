@@ -1,4 +1,4 @@
-"""CPU-safe reference checks; run with python -m tokengate.e2e_gate.tests.test_sdpa_compat.
+"""CPU-safe reference checks; run with python -m tests.attention.test_sdpa_compat.
 
 These establish attention semantics, not T4 end-to-end compatibility.
 """

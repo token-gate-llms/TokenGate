@@ -10,7 +10,7 @@ what this test exists to catch.
 
 Run (single GPU, needs a real checkpoint + the tokenized val store):
 
-  python -m tokengate.e2e_gate.tests.test_eval_parity \\
+  python -m tests.evaluation.test_eval_parity \\
       --gate-path <run_dir>/baseline/L1/gate_stepN.pt --gate-layer 1
 
 Not a pytest test (repo convention): prints a pass/fail summary and exits
@@ -23,7 +23,7 @@ import sys
 
 import torch
 
-REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
