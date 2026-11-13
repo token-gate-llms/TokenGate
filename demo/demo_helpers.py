@@ -480,8 +480,8 @@ def release_niah_config_kwargs(repo_root: str | Path, base_model: str,
                                output_dir: str | Path, data_root: str | Path,
                                num_gpus: int) -> dict:
     """Public TokenGateConfig inputs for the stated NIAH-only release recipe."""
-    if num_gpus not in (1, 2, 4):
-        raise ValueError("use 1, 2, or 4 visible A100s for effective batch size 4")
+    if num_gpus != 4:
+        raise ValueError("the full demo training recipe requires four visible A100 GPUs")
     root = Path(repo_root)
     if base_model not in ("Qwen/Qwen3-1.7B", "Qwen/Qwen3.5-2B"):
         raise ValueError(f"no released NIAH recipe for {base_model}")
@@ -490,7 +490,7 @@ def release_niah_config_kwargs(repo_root: str | Path, base_model: str,
         learning_rate=1e-4, epochs=20, max_steps=(3000 if base_model.endswith("1.7B") else 18000),
         k_eval=[2000], lora_rank=16, lora_alpha=32, lora_lr=1e-4,
         lora_targets=["q_proj", "v_proj"],
-        num_gpus=num_gpus, batch_size=1, grad_accum=4 // num_gpus,
+        num_gpus=num_gpus, batch_size=1, grad_accum=1,
         warmup_steps=1000, lr_schedule="constant", optim="muon",
         gate_optimizer="muon", weight_decay=0.1, no_decay_scalars=True,
         phase2_loguniform=True, shuffle_epochs=True, seed=0,
@@ -501,7 +501,9 @@ def release_niah_config_kwargs(repo_root: str | Path, base_model: str,
         eval_split=str(root / "tokengate/datasets/eval_splits/longbench_eval_split_niah_iso_v1.json"),
         eval_group_override="niah:niah_kamradt", eval_test_full_tasks=None,
         target_balanced_map=str(root / "tokengate/datasets/maps/eval_target_train_map_v17_niah_only.yaml"),
-        data_root=str(data_root), packed=True, grad_checkpoint=False,
+        # Qwen3.5 needs activation checkpointing for the full-context lane.
+        data_root=str(data_root), packed=True,
+        grad_checkpoint=base_model.endswith("2B"),
         wandb_project=None,
     )
 
@@ -510,6 +512,8 @@ def train_demo_sft_baseline(base_model: str, data_root: str | Path,
                             eval_split: str | Path, output_dir: str | Path,
                             num_gpus: int) -> Path:
     """Run the notebook's separate full-prefill LoRA control on the same rows."""
+    if num_gpus != 4:
+        raise ValueError("the full demo training recipe requires four visible A100 GPUs")
     output_dir = Path(output_dir)
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", "peft>=0.15"],
                    check=True)
@@ -522,6 +526,6 @@ def train_demo_sft_baseline(base_model: str, data_root: str | Path,
         str(Path(__file__).with_name("train_lora_baseline.py")), "--base-model", base_model,
         "--data-root", str(data_root), "--eval-split", str(eval_split),
         "--output-dir", str(output_dir), "--max-steps", str(steps),
-        "--grad-accum", str(4 // num_gpus),
+        "--grad-accum", "1",
     ], check=True)
     return output_dir
