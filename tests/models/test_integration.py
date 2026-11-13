@@ -4,7 +4,7 @@
 Quick sanity check that the patched model works correctly.
 
 Run:
-    python -m tokengate.e2e_gate.test_integration
+    python -m tests.models.test_integration
 """
 
 import torch

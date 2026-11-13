@@ -12,19 +12,19 @@ realistic seq lengths) or synthetic sequences of a specified length.
 Usage
 -----
 # With real data (reads from a tokenized cache or builds one):
-python -m tokengate.e2e_gate.tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B \\
     --gate-layer 8 --k-low 50 --k-high 5000 \\
     --dataset biodex --task biodex_reactions
 
 # Synthetic sequences (no dataset needed):
-python -m tokengate.e2e_gate.tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B \\
     --gate-layer 8 --k-low 50 --k-high 5000 \\
     --synthetic --seq-len 8192 --article-len 6000
 
 # Sweep specific batch sizes only:
-python -m tokengate.e2e_gate.tests.benchmark_training \\
+python -m benchmarks.benchmark_training \\
     --base-model Qwen/Qwen3-0.6B --gate-layer 8 \\
     --batch-sizes 1 2 4 8 16 --k-values 500 2000 5000
 """
@@ -40,7 +40,7 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
