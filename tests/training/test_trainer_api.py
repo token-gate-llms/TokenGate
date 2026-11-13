@@ -7,7 +7,7 @@ committed iso-split recipe (sorted ids, first N val), and that the CLI
 TokenGateTrainer generates parses cleanly with the trainer's real argparse
 parser (so the two interfaces cannot silently drift apart).
 
-Run: python -m tokengate.e2e_gate.tests.test_trainer_api
+Run: python -m tests.training.test_trainer_api
 """
 import dataclasses
 import json

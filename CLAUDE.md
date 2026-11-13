@@ -7,7 +7,7 @@
   inference falls back to FlexAttention with a warning; training requires an explicit
   `attn_backend="flex"`.
 - Tests are **script-style `main()` modules, not pytest**:
-  `python -m tokengate.e2e_gate.tests.test_trainer_api` (CPU-safe);
+  `python -m tests.training.test_trainer_api` (CPU-safe);
   `test_niah_demo` / `test_biodexr_demo` need one GPU each.
 - Benchmarks: `python benchmarks/run_benchmark.py --config benchmarks/configs/<ds>.yaml
   --split val|test`.
