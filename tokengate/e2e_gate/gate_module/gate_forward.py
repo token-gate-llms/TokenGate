@@ -272,7 +272,7 @@ def build_gate_branch(model, gate, gate_layer: int):
     Parameter STORAGE is always float32 (CastLinear): the optimizer update and the
     SWA running mean both need it -- a bf16 param rounds away every per-step Muon
     update below its ULP (at |w|~0.02: ~80% of elements at lr=1e-4, ~97% at 1.4e-5),
-    and a bf16 running mean decays as n0/n (tests/test_swa_precision.py).
+    and a bf16 running mean decays as n0/n (tests/training/test_swa_precision.py).
     COMPUTE runs in the dtype of the branch input (the backbone's a_j boundary: bf16
     for a bf16 backbone) -- CastLinear casts its fp32 weights to the input dtype per
     forward, so the matmuls stay at backbone precision and cost (the branch is
@@ -367,7 +367,7 @@ def split_gate_layer_mlp(gate) -> bool:
     the branch reads hs_d, so the scoring gradient reaches Phase 1 through the same
     single reconnection as the LM gradient) and runs the BACKBONE gate-layer MLP on
     kept tokens only at Phase-2 entry (`gate_layer_mlp`) — exact, because the MLP is
-    position-wise (tests/test_split_gate_layer.py).
+    position-wise (tests/gate/test_split_gate_layer.py).
     """
     return getattr(gate, "gate_branch", None) is not None
 
@@ -432,6 +432,11 @@ def _attn_only_forward_eager(layer, hidden_states, position_ids, cache, cache_po
     return residual + hs
 
 
+# Bound the point-wise MLP workspace during eager inference. Attention still
+# processes the entire batch/context and writes the same full KV cache.
+_PREFILL_MLP_TOKEN_LIMIT = 65_536
+
+
 def _gate_layer_mlp_eager(layer, a):
     """The gate layer's MLP sublayer: a + MLP(LN2(a)). Position-wise.
 
@@ -440,7 +445,23 @@ def _gate_layer_mlp_eager(layer, a):
     modules. Batched callers pass right-zero-padded rows: RMSNorm and the Qwen3 MLP
     linears are bias-free, so zero rows map to zero and padding is preserved.
     """
-    return a + layer.mlp(layer.post_attention_layernorm(a))
+    if torch.is_grad_enabled() or a.numel() // a.shape[-1] <= _PREFILL_MLP_TOKEN_LIMIT:
+        return a + layer.mlp(layer.post_attention_layernorm(a))
+    flat = a.reshape(-1, a.shape[-1])
+    output = torch.empty_like(flat)
+    for start in range(0, flat.shape[0], _PREFILL_MLP_TOKEN_LIMIT):
+        chunk = flat[start:start + _PREFILL_MLP_TOKEN_LIMIT]
+        output[start:start + chunk.shape[0]] = chunk + layer.mlp(layer.post_attention_layernorm(chunk))
+    return output.view(a.shape)
+
+
+def _qwen3_prefill_layer(layer, hs, **kwargs):
+    """The existing Qwen3 layer split, with a bounded point-wise MLP workspace."""
+    boundary = attn_only_forward(
+        layer, hs, kwargs["position_ids"], kwargs["past_key_values"],
+        kwargs["cache_position"], kwargs["position_embeddings"],
+    )
+    return _gate_layer_mlp_eager(layer, boundary)
 
 
 def call_layer_padsafe(layer, hs, pad_lens, **kwargs):
@@ -457,10 +478,21 @@ def call_layer_padsafe(layer, hs, pad_lens, **kwargs):
     tokens run on a fresh state and the layer's final cache state is exact.
     The output is rolled back so the surrounding right-padded layout
     (full-attn KV slots, last-valid indexing) is untouched.  Full-attention
-    layers (and pad-free batches) pass through unchanged.  Loss/logit
+    layers (and pad-free batches) need no padding rotation. Large eager Qwen3
+    prefills split attention from the point-wise MLP to bound its workspace;
+    the full attention batch and KV cache are unchanged. Loss/logit
     positions were never affected (causality), so the TRAIN forward does not
     route through this helper."""
     call = kwargs.pop("fn", layer)
+    if call is layer and not torch.is_grad_enabled() \
+            and kwargs.get("attention_mask") is None and kwargs.get("use_cache") is True \
+            and hs.numel() // hs.shape[-1] > _PREFILL_MLP_TOKEN_LIMIT:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+        # This split matches Qwen3DecoderLayer.forward. Other decoder types
+        # retain their own forward contracts (including hybrid recurrent state).
+        if type(layer) is Qwen3DecoderLayer:
+            def call(h, **kw):
+                return _qwen3_prefill_layer(layer, h, **kw)
     if getattr(layer, "block_type", getattr(layer, "layer_type", "full_attention")) != "linear_attention" \
             or not any(pad_lens):
         return call(hs, **kwargs)
@@ -1352,11 +1384,9 @@ def prefill_batch_for_decode(
 
     # a_j phase boundary for the 'mlp' scoring branch (split_gate_layer_mlp).
     _split = split_gate_layer_mlp(gate)
-    _gate_layer_input = None
     _p1_pads = [max_seq_len - len(ids) for ids in prompt_ids_list]
     for i in range(gate_layer + 1):
         if i == gate_layer:
-            _gate_layer_input = hidden_states  # input to the gate/TSP layer (for the FastKV rule)
             if _split:
                 hidden_states = call_layer_padsafe(
                     inner.layers[i], hidden_states, _p1_pads,
@@ -1421,6 +1451,10 @@ def prefill_batch_for_decode(
         all_keep_indices.append((b_idx, keep_indices, topk_local, article_start, article_end, b_scores, n_kept_art))
         max_n_kept = max(max_n_kept, n_kept)
 
+    # The scorer's full-context representation is no longer needed. Its last
+    # per-sample view also owns the backing storage, even after deleting gate_hs.
+    del gate_hs, h_art, h_art_cast
+
     # ── Prune: gather kept tokens, build batched gate bias ───────────────────
     _p.__exit__(None, None, None)
     _p = _rf("prefill/prune+bias"); _p.__enter__()
@@ -1456,6 +1490,11 @@ def prefill_batch_for_decode(
         gate_bias_batched[b_idx, :n_kept] = b_pruned.to(hs_device)
         if n_kept < n_alloc:
             gate_bias_batched[b_idx, n_kept:] = -1e9
+
+    # Phase 2 only needs the gathered states and positions. Retaining Phase-1
+    # activations here adds several GiB at long context / large batch sizes.
+    del hidden_states, input_ids_padded
+    pe = position_ids = cache_pos = None
 
     if _split:
         # Phase-2 entry: gate layer's own MLP on kept tokens (padding rows stay zero).

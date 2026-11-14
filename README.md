@@ -189,8 +189,8 @@ the gate's selection lands squarely on the needle sentence.
 A second demo on real data follows the same pattern:
 `examples/biodexr_demo.py` (BioDEX adverse-drug-reaction extraction; mean
 exact-match set F1 0.622 at K=2000 over the committed val articles). Both
-pipelines are covered by `python -m tokengate.e2e_gate.tests.test_niah_demo`
-and `...tests.test_biodexr_demo`, and `--gate-attn flex` avoids the
+pipelines are covered by `python -m tests.examples.test_niah_demo`
+and `python -m tests.examples.test_biodexr_demo`, and `--gate-attn flex` avoids the
 custom-kernel build at some speed cost.
 
 For a full accuracy + latency comparison against standard prefill,
@@ -229,6 +229,46 @@ set above plus `liana313/tokengate-2wikimqa-qwen3-1.7b`,
 `liana313/tokengate-multinews-qwen3-1.7b`, and the hybrid-attention
 `liana313/tokengate-niah-qwen3.5-2b` — each repo holds the exact gate+LoRA
 checkpoint the paper's benchmarks used.
+
+### Batched inference with vLLM
+
+`benchmarks/run_vllm_benchmark.py` compares the original TokenGate implementation,
+TokenGate in vLLM, and the base model in vLLM. The
+[inference notebook](examples/inference-vllm.ipynb) installs the published
+TokenGate vLLM fork at a pinned revision. Section 6 prepares all 184 held-out
+examples and runs both models at K=2048/All and B/C=1/2/4/8/16, including finite
+accuracy passes and 60-second sustained measurements. It creates new results
+by default and does not require a downloaded results directory.
+
+For a small static-batching check on the **five bundled examples**, use the
+notebook's vLLM checkout and its environment's Python interpreter:
+
+```bash
+.venv/bin/python -m benchmarks.run_vllm_benchmark \
+  --config benchmarks/configs/vllm_niah_qwen3.yaml --k 2048 \
+  --vllm-source /path/to/vllm --vllm-python /path/to/vllm/.venv/bin/python \
+  --engines original vllm_tiled vllm_base \
+  --mode static --batch-size 4 --warmups 1 --repeats 3 \
+  --output results/batching-qwen3-b4
+```
+
+The bundled config's `samples` file contains only those five examples;
+`--split test` alone does not expand it to the full held-out pool. Use the
+notebook's prepared configurations for the full evaluation.
+
+Static batching submits a group of requests together and waits for the group to
+finish. With `--mode continuous`, a completed request is replaced immediately,
+up to `--batch-size` concurrent requests; this mode supports the vLLM engines.
+K still controls retained tokens per input, independently of batch size.
+
+The default comparison uses matched eager execution settings. Run the base model
+separately with `--base-settings normal` to measure vLLM's default compilation and
+scheduling features; prefix caching stays disabled in both comparisons.
+For sustained throughput, add `--duration 60 --ramp-up 5` in continuous mode.
+Keep a finite test pass for accuracy: repeated load does not add test examples.
+Throughput includes submission gaps and uses elapsed wall time, with ramp-up
+and draining excluded only for sustained windows. Saved request timelines,
+scheduled batch sizes, and memory statistics make the measurement auditable.
 
 ### Training the TokenGate model
 
