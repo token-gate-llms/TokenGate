@@ -14,7 +14,7 @@ from tokengate.experimental.jev import (
 )
 from tokengate.e2e_gate.gate_module.e2e_gate_module import E2EGate
 from tokengate.e2e_gate.gate_module.gate_forward import (
-    _attn_only_forward_eager, build_gate_branch, call_layer_padsafe,
+    _apply_gate_bias, _attn_only_forward_eager, build_gate_branch, call_layer_padsafe,
 )
 
 
@@ -60,10 +60,14 @@ class JevBridgeTests(unittest.TestCase):
     def test_baseline_and_input_pruning(self):
         full = standard_decide(self.model, None, self.request)
         short = input_pruned_decide(self.model, None, self.request, token_budget=1)
+        middle = input_pruned_decide(self.model, None, self.request, token_budget=1, method="middle")
+        suffix = input_pruned_decide(self.model, None, self.request, token_budget=1, method="suffix")
         random = input_pruned_decide(self.model, None, self.request, token_budget=3, method="random")
         self.assertEqual(full.state_tokens, 3)
         self.assertGreater(full.answers["refund"]["true_probability"], 0.9)
         self.assertLess(short.answers["refund"]["true_probability"], 0.1)
+        self.assertGreater(middle.answers["refund"]["true_probability"], 0.9)
+        self.assertLess(suffix.answers["refund"]["true_probability"], 0.1)
         self.assertEqual(random.kept_positions, list(range(7)))
 
     def test_gated_scores_use_decision_head_slots(self):
@@ -158,6 +162,18 @@ class JevBridgeTests(unittest.TestCase):
         actual = call_layer_padsafe(layer, hidden, [1], fn=capture)
         self.assertTrue(torch.equal(seen[0], torch.tensor([[[0.0], [1.0], [2.0]]])))
         self.assertTrue(torch.equal(actual, hidden))
+
+    def test_zero_bias_ablation_preserves_selection_bias_shape(self):
+        gate = SimpleNamespace(n_layers_bias=1, zero_gate_bias=True,
+                               scaled_softmax_scale=False)
+        bias = torch.tensor([[1.0, -2.0]])
+        with patch("tokengate.e2e_gate.gate_module.gate_forward._full_attn_layers_above", return_value=[3]), \
+             patch("tokengate.e2e_gate.gate_module.gate_forward.set_ssmax_ratio_for_layers"), \
+             patch("tokengate.e2e_gate.gate_module.gate_forward.set_gate_bias_for_layers") as set_bias:
+            _apply_gate_bias(self.model, gate, 1, 4, bias, per_head=False)
+        applied = set_bias.call_args.args[3]
+        self.assertEqual(applied.shape, bias.shape)
+        self.assertTrue(torch.equal(applied, torch.zeros_like(bias)))
 
 
 if __name__ == "__main__":

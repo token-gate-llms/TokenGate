@@ -644,6 +644,11 @@ def _apply_gate_bias(
         set_ssmax_ratio_for_layers(model, gate_layer + 1, n_layers, None)
         return
 
+    # Keep the selection and learned attention temperature intact for a
+    # selection-only ablation, including the batched decode-prefill path.
+    if getattr(gate, "zero_gate_bias", False):
+        gate_bias = torch.zeros_like(gate_bias)
+
     if gate.n_layers_bias > 0:
         if len(full_attn_above) != gate.n_layers_bias:
             raise ValueError(

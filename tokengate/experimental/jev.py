@@ -137,8 +137,8 @@ def input_pruned_decide(
 ) -> DecisionResult:
     """Cheap comparison: prune state IDs before the ordinary JEV forward.
 
-    ``prefix`` keeps the start of the state; ``random`` samples state tokens
-    without replacement and restores their original order. Neither scores
+    ``prefix``, ``middle``, or ``suffix`` keeps one fixed part of the state; ``random`` samples
+    state tokens without replacement and restores their original order. None scores
     token importance or applies TokenGate's Phase-2 attention bias.
     """
     if token_budget < 1:
@@ -148,11 +148,16 @@ def input_pruned_decide(
     k = min(token_budget, state_len)
     if method == "prefix":
         local = list(range(k))
+    elif method == "middle":
+        start_at = (state_len - k) // 2
+        local = list(range(start_at, start_at + k))
+    elif method == "suffix":
+        local = list(range(state_len - k, state_len))
     elif method == "random":
         generator = torch.Generator(device="cpu").manual_seed(seed)
         local = torch.randperm(state_len, generator=generator)[:k].sort().values.tolist()
     else:
-        raise ValueError("method must be 'prefix' or 'random'")
+        raise ValueError("method must be 'prefix', 'middle', 'suffix', or 'random'")
     positions = list(range(start)) + [start + i for i in local] + list(range(end, len(ids)))
     shortened = inputs["input_ids"][:, positions]
     new_inputs = {"input_ids": shortened, "marks": torch.tensor([len(positions)])}

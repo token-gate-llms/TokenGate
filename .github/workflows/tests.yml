@@ -52,6 +52,8 @@ jobs:
         run: .venv/bin/python -m tests.gate.test_gate_branch_graph
       - name: Inference API
         run: .venv/bin/python -m tests.inference.test_inference_api
+      - name: JEV bridge
+        run: .venv/bin/python -m tests.models.test_jev_bridge
       - name: Prefill memory
         run: .venv/bin/python -m tests.inference.test_prefill_memory
       - name: Benchmark and padding regressions
