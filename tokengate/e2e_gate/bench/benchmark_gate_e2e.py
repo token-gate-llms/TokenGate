@@ -621,7 +621,8 @@ GATE_COMPILE = ("none", "p2", "all")
 
 
 def load_gate_model(base_model, gate_path, gate_layer, gate_attn="fa2",
-                    merge_adapters_above_gate=False, compile_phase2="none", cuda_graphs=False):
+                    merge_adapters_above_gate=False, compile_phase2="none", cuda_graphs=False,
+                    dtype=torch.bfloat16):
     """gate_attn names the inference attention kernels
     (qwen3_flex_attention.GATE_ATTN); "fa2" (FA2 flash causal + the
     FlashAttention-2 key-bias kernel) is the default and matches the final
@@ -637,7 +638,7 @@ def load_gate_model(base_model, gate_path, gate_layer, gate_attn="fa2",
     from transformers import AutoModelForCausalLM
     from tokengate.e2e_gate.gate_module.lora import find_adapter_path
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, torch_dtype=torch.bfloat16, attn_implementation="sdpa",
+        base_model, dtype=dtype, attn_implementation="sdpa",
     ).to(DEVICE).eval()
 
     full_attn = get_full_attn_layer_indices(model)
@@ -765,7 +766,8 @@ def load_gate_model(base_model, gate_path, gate_layer, gate_attn="fa2",
               + ("; gate layer's split halves compiled" if compile_phase2 == "all" else ""), flush=True)
     elif compile_phase2 != "none":
         raise ValueError(f"compile_phase2 {compile_phase2!r} not in {GATE_COMPILE}")
-    warmup_flex_attention(DEVICE)
+    if gate_attn != "sdpa":
+        warmup_flex_attention(DEVICE)
     # load_gate() reconstructs the scoring branch itself: fp32-storage CastLinears
     # that compute in the input dtype (the bf16 backbone activations), exactly the
     # modules training used -- no rebuild from the base model, no fp32-compute drift
@@ -777,10 +779,10 @@ def load_gate_model(base_model, gate_path, gate_layer, gate_attn="fa2",
                            f"scoring branch: {gate_path}")
     if _gb_mode:
         from tokengate.e2e_gate.gate_module.e2e_gate_module import freeze_cast_linears
-        _nf = freeze_cast_linears(gate.gate_branch, torch.bfloat16)
+        _nf = freeze_cast_linears(gate.gate_branch, dtype)
         print(f"[gate] scoring branch ({_gb_mode}): "
               f"{sum(p.numel() for p in gate.gate_branch.parameters())/1e6:.2f}M params, "
-              f"fp32 storage, compute in the backbone dtype ({_nf} CastLinears' bf16 copies frozen)", flush=True)
+              f"fp32 storage, compute in the backbone dtype ({_nf} CastLinears' {dtype} copies frozen)", flush=True)
     print(f"[gate] ready (layer={gate_layer}, d_model={gate.d_model})", flush=True)
     return model, gate, input_all_prev_layers
 

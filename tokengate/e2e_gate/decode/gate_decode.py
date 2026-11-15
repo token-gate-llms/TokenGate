@@ -158,11 +158,14 @@ def generate_batch(
         # they need their own pad mask (pads at [len_i, S); decode-appended
         # slots valid for all) and their own cache_position (append at S+step).
         S = max(len(p) for p in prompt_ids_list)
-        _first_kv = next(cl for cl in cache.layers[:gate_layer + 1]
-                         if hasattr(cl, "keys") and cl.keys is not None)
-        assert _first_kv.keys.shape[2] == S, (
-            f"below-gate cache width {_first_kv.keys.shape[2]} != phase-1 padded "
-            f"len {S} — prefill/decode disagree about prune_below_gate")
+        _first_kv = next((cl for cl in cache.layers[:gate_layer + 1]
+                          if hasattr(cl, "keys") and cl.keys is not None), None)
+        # Hybrid Qwen3.5 can gate at a DeltaNet layer: every below-gate
+        # cache is recurrent state, with no per-token keys to check here.
+        if _first_kv is not None:
+            assert _first_kv.keys.shape[2] == S, (
+                f"below-gate cache width {_first_kv.keys.shape[2]} != phase-1 padded "
+                f"len {S} — prefill/decode disagree about prune_below_gate")
         below_mask = torch.zeros(B, 1, 1, S + max_new_tokens,
                                  dtype=dec_dtype, device=device)
         for _b, _p in enumerate(prompt_ids_list):
