@@ -147,36 +147,41 @@ def _decode_answer(tokenizer, ids: list[int]) -> str:
 def plain_generate(model, tokenizer, prompt_ids: list[int], *,
                    max_new_tokens: int = 64, chunk_tokens: int | None = None
                    ) -> tuple[str, float]:
-    """Greedy full-context generation; return (answer, prefill-to-first-token s).
+    """Run the ordinary full-context baseline; return (answer, prefill s).
 
-    ``chunk_tokens=None`` is the unmodified model's *single-pass* prefill, the
-    same reference definition as ``benchmarks/run_benchmark.py``. A chunk size
-    is a memory-safe full-context T4 path, but its timing is not paper-style.
+    The single-pass path reuses the project's benchmark implementation. A
+    chunk size selects the separate memory-safe full-context path for T4; its
+    timing is not paper-style. Qwen3.5 uses single-pass prefill because its
+    recurrent state cannot be continued correctly across multi-token chunks.
     """
+    if max_new_tokens < 1 or (chunk_tokens is not None and chunk_tokens < 1):
+        raise ValueError("max_new_tokens and chunk_tokens must be positive")
+    if chunk_tokens is None:
+        from tokengate.e2e_gate.bench.benchmark_gate_e2e import vanilla_generate_single
+
+        answer, _, _, prefill_s, _ = vanilla_generate_single(
+            model, tokenizer, prompt_ids, max_new_tokens)
+        return answer, prefill_s
+    if "qwen3_5" in model.config.model_type:
+        raise ValueError("Qwen3.5 needs single-pass prefill in this demo; select an A100 baseline")
+
     import torch
     from transformers.cache_utils import DynamicCache
 
-    if max_new_tokens < 1 or (chunk_tokens is not None and chunk_tokens < 1):
-        raise ValueError("max_new_tokens and chunk_tokens must be positive")
-    if chunk_tokens and "qwen3_5" in model.config.model_type:
-        # Transformers 5.5 DeltaNet reuses its recurrent state only for
-        # one-token decode; multi-token incremental chunks restart that state.
-        raise ValueError("Qwen3.5 needs single-pass prefill in this demo; select an A100 baseline")
     ids = torch.tensor([prompt_ids], dtype=torch.long, device=model.device)
     length = ids.shape[1]
-    cache = DynamicCache(config=model.config) if chunk_tokens else None
-    steps = chunk_tokens or length
+    cache = DynamicCache(config=model.config)
     torch.cuda.synchronize()
     start_time = time.perf_counter()
     with torch.inference_mode():
-        for start in range(0, length, steps):
-            end = min(start + steps, length)
-            kw = dict(input_ids=ids[:, start:end], past_key_values=cache,
-                      use_cache=True, logits_to_keep=1)
-            if chunk_tokens:
-                kw.update(attention_mask=torch.ones((1, end), device=model.device, dtype=torch.long),
-                          cache_position=torch.arange(start, end, device=model.device))
-            out = model(**kw)
+        for start in range(0, length, chunk_tokens):
+            end = min(start + chunk_tokens, length)
+            out = model(
+                input_ids=ids[:, start:end], past_key_values=cache, use_cache=True,
+                logits_to_keep=1,
+                attention_mask=torch.ones((1, end), device=model.device, dtype=torch.long),
+                cache_position=torch.arange(start, end, device=model.device),
+            )
             cache = out.past_key_values
             if end == length:
                 next_id = out.logits[:, -1].argmax(-1, keepdim=True)
@@ -191,12 +196,12 @@ def plain_generate(model, tokenizer, prompt_ids: list[int], *,
             generated.append(token)
             if step == max_new_tokens - 1:
                 break
-            kw = dict(input_ids=next_id, past_key_values=cache,
-                      use_cache=True, logits_to_keep=1)
-            if chunk_tokens:
-                kw.update(attention_mask=torch.ones((1, length + step + 1), device=model.device, dtype=torch.long),
-                          cache_position=torch.tensor([length + step], device=model.device))
-            out = model(**kw)
+            out = model(
+                input_ids=next_id, past_key_values=cache, use_cache=True,
+                logits_to_keep=1,
+                attention_mask=torch.ones((1, length + step + 1), device=model.device, dtype=torch.long),
+                cache_position=torch.tensor([length + step], device=model.device),
+            )
             cache = out.past_key_values
             next_id = out.logits[:, -1].argmax(-1, keepdim=True)
             del out
