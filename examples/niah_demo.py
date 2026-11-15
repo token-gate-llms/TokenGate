@@ -49,10 +49,11 @@ def main():
                     help="inference kernels; 'flex' needs no custom build")
     args = ap.parse_args()
 
-    from tokengate import apply_chat_template, load_model, split_state_span
+    from tokengate import load_model, split_state_span
     from tokengate.datasets.tasks import get_task
     from tokengate.datasets.tasks.longbench import _normalize
     from transformers import AutoTokenizer
+    import demo_helpers as demo
 
     # base_model + gate_layer come from the checkpoint's own metadata
     model = load_model(args.checkpoint, gate_attn=args.gate_attn)
@@ -60,19 +61,14 @@ def main():
 
     task = get_task("niah_kamradt")
     samples = [json.loads(l) for l in open(args.samples)][: args.n]
-    # The task's own prompt with the haystack as the {state} placeholder —
-    # training-identical wording; the question and instructions are outside
-    # the state and never pruned.
-    ids = [apply_chat_template(
-               tok, task.format_prompt("{state}\n\nQuestion: " + s["question"]),
-               state=s["body"])
-           for s in samples]
+    # Share prompt construction with the Colab NIAH walkthrough.
+    ids = [demo.niah_prompt(tok, sample)[0] for sample in samples]
     clean = [split_state_span(seq) for seq in ids]  # (clean_ids, s, e) per row
 
     def _run(k_label, k):
         accs, ttfts, needle_kept = [], [], []
         for s, seq, (cids, st, en) in zip(samples, ids, clean):
-            out = model.generate([seq], tok, max_kept_prefill_tokens=k)
+            out = demo.generate_gate(model, tok, seq, budget=k)
             accs.append(task.evaluate(out.answers[0], s["answer"]))
             ttfts.append(out.prefill_s)
             # fraction of the needle phrase's words that survived the pruning

@@ -139,6 +139,13 @@ def niah_prompt(tokenizer, row: dict) -> tuple[list[int], list[int]]:
     return gated, plain
 
 
+def generate_gate(model, tokenizer, prompt: list[int], *, budget: int | None = None,
+                  max_new_tokens: int = 20):
+    """Run one public TokenGate generation for a NIAH prompt."""
+    return model.generate([prompt], tokenizer, max_new_tokens=max_new_tokens,
+                          max_kept_prefill_tokens=budget)
+
+
 def _decode_answer(tokenizer, ids: list[int]) -> str:
     from tokengate.generators import _strip_thinking
     return _strip_thinking(tokenizer.decode(ids, skip_special_tokens=True))
@@ -239,10 +246,10 @@ def gate_results(model, tokenizer, prompts: list[list[int]], rows: list[dict],
     results = []
     for k in budgets:
         for prompt, row in zip(prompts, rows):
-            model.generate([prompt], tokenizer, max_kept_prefill_tokens=k, max_new_tokens=64)
+            generate_gate(model, tokenizer, prompt, budget=k, max_new_tokens=64)
             torch.cuda.reset_peak_memory_stats()
-            out = model.generate([prompt], tokenizer, max_kept_prefill_tokens=k,
-                                 max_new_tokens=64)
+            out = generate_gate(model, tokenizer, prompt, budget=k,
+                                max_new_tokens=64)
             _, state_start, state_end = split_state_span(prompt)
             kept_state = sum(state_start <= p < state_end for p in out.kept_pos[0])
             results.append(dict(city=row["city"], depth=row["depth_actual"],
