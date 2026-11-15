@@ -6,8 +6,10 @@
 - Optional fast kernel: `python kernels/fa2bias/build.py` (needs nvcc). Without it,
   inference falls back to FlexAttention with a warning; training requires an explicit
   `attn_backend="flex"`.
-- Tests are **script-style `main()` modules, not pytest**:
-  `python -m tests.training.test_trainer_api` (CPU-safe);
+- Tests live under `tests/`, grouped by subsystem. Most use script-style
+  entry points, e.g. `python -m tests.training.test_trainer_api` (CPU-safe).
+  Run benchmark and padding regressions with
+  `python -m pytest tests/benchmarks tests/inference/test_prefill_padding.py`.
   `test_niah_demo` / `test_biodexr_demo` need one GPU each.
 - Benchmarks: `python benchmarks/run_benchmark.py --config benchmarks/configs/<ds>.yaml
   --split val|test`.

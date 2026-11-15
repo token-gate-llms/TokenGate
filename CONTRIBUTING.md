@@ -11,7 +11,7 @@ source .venv/bin/activate
 uv pip install -e ".[train]"
 ```
 
-For CPU tests, use `uv pip install --torch-backend=cpu -e .` instead.
+For CPU tests, use `uv pip install --torch-backend=cpu -e '.[benchmark]' pytest` instead.
 For CUDA training, you can build the fast attention kernel with
 `python kernels/fa2bias/build.py` (requires `nvcc`). Without it, inference
 falls back to FlexAttention; training needs `attn_backend="flex"`.
@@ -19,7 +19,7 @@ falls back to FlexAttention; training needs `attn_backend="flex"`.
 ## Tests
 
 Tests live under `tests/`, grouped by subsystem. Run each script as a module
-from the repository root. These five suites run on CPU:
+from the repository root. These suites run on CPU:
 
 ```bash
 python -m tests.training.test_trainer_api
@@ -27,6 +27,14 @@ python -m tests.training.test_swa_precision
 python -m tests.gate.test_split_gate_layer
 python -m tests.gate.test_gate_branch_graph
 python -m tests.inference.test_inference_api
+python -m tests.inference.test_prefill_memory
+```
+
+Benchmark regressions live in `tests/benchmarks/`; padding regressions live
+in `tests/inference/`. Run these with pytest:
+
+```bash
+python -m pytest tests/benchmarks tests/inference/test_prefill_padding.py -q
 ```
 
 Some tests download public Qwen configs or tokenizers from Hugging Face.
@@ -40,7 +48,7 @@ python -m tests.examples.test_biodexr_demo
 
 Performance benchmarks live in `benchmarks/`.
 
-GitHub Actions runs the five CPU suites on Python 3.10 and 3.12 for every PR.
+GitHub Actions runs these CPU suites on Python 3.10 and 3.12 for every PR.
 Add new CPU suites to `.github/workflows/tests.yml`. GPU suites run manually.
 
 To block failing merges, a repository administrator must require the **Tests**
