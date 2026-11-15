@@ -53,7 +53,10 @@ def main():
     from tokengate.datasets.tasks import get_task
     from tokengate.datasets.tasks.longbench import _normalize
     from transformers import AutoTokenizer
-    import demo_helpers as demo
+    if __package__:
+        from . import demo_helpers as demo
+    else:
+        import demo_helpers as demo
 
     # base_model + gate_layer come from the checkpoint's own metadata
     model = load_model(args.checkpoint, gate_attn=args.gate_attn)
